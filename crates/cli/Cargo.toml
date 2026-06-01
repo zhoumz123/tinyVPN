@@ -1,0 +1,15 @@
+[package]
+name = "tinyvpn-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tinyvpn-core = { workspace = true }
+tinyvpn-p2p = { workspace = true }
