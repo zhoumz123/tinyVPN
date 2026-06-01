@@ -6,7 +6,7 @@ use crate::registry::{Registry, SharedRegistry};
 
 /// Run the control server on the given address (QUIC transport)
 pub async fn run(addr: &str, relay_addr: String) -> Result<()> {
-    let registry: SharedRegistry = Arc::new(RwLock::new(Registry::new(relay_addr)));
+    let registry: SharedRegistry = Arc::new(RwLock::new(Registry::new(relay_addr)?));
 
     // Periodic stale-node reaper
     let reap_registry = registry.clone();
@@ -62,7 +62,7 @@ async fn handle_connection(
         let response = match msg {
             ControlMessage::Register { name, public_key } => {
                 let mut reg = registry.write().await;
-                let (node_id, vpn_ip, session_token) = reg.register(name, public_key);
+                let (node_id, vpn_ip, session_token) = reg.register(name, public_key)?;
                 tracing::info!("Registered node {} → {}", node_id, vpn_ip);
                 serde_json::to_string(&ControlMessage::RegisterOk {
                     node_id,
