@@ -145,3 +145,81 @@ impl Relay {
         tracing::info!("Registered {} -> {} (waiting for peer)", my_id, peer_id);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn register_pair_and_forward() {
+        let relay = Relay::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.socket.local_addr().unwrap();
+
+        // Run relay in background
+        let relay_handle = tokio::spawn(async move {
+            let _ = relay.run().await;
+        });
+
+        // Two nodes register
+        let node_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let node_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Node A registers: I am A, want to talk to B
+        node_a.send_to(b"REGISTER:node-a:node-b", relay_addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node_a.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("OK"));
+
+        // Node B registers: I am B, want to talk to A
+        node_b.send_to(b"REGISTER:node-b:node-a", relay_addr).await.unwrap();
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node_b.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("OK"));
+
+        // Now A can send data to B through relay
+        node_a.send_to(b"hello from A", relay_addr).await.unwrap();
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node_b.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"hello from A");
+
+        // And B can send to A
+        node_b.send_to(b"hello from B", relay_addr).await.unwrap();
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node_a.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"hello from B");
+
+        relay_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_packet_dropped() {
+        let relay = Relay::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.socket.local_addr().unwrap();
+
+        let relay_handle = tokio::spawn(async move {
+            let _ = relay.run().await;
+        });
+
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger.send_to(b"random data", relay_addr).await.unwrap();
+
+        // Nothing should come back — no session registered
+        let mut buf = [0u8; 64];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            stranger.recv_from(&mut buf),
+        ).await;
+        assert!(result.is_err()); // timeout = no response
+
+        relay_handle.abort();
+    }
+}

@@ -65,3 +65,50 @@ fn dirs_home() -> anyhow::Result<PathBuf> {
         std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config() -> NodeConfig {
+        NodeConfig {
+            node_id: "node-test".into(),
+            name: "test".into(),
+            private_key: "privkey123".into(),
+            vpn_ip: "10.13.0.5".into(),
+            ccs_addr: "127.0.0.1:9090".into(),
+            session_token: "tok123".into(),
+        }
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let dir = std::env::temp_dir().join("tinyvpn_test_config");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config = make_config();
+        let path = dir.join("config.json");
+        let data = serde_json::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, &data).unwrap();
+
+        let loaded: NodeConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert_eq!(loaded.node_id, config.node_id);
+        assert_eq!(loaded.name, config.name);
+        assert_eq!(loaded.vpn_ip, config.vpn_ip);
+        assert_eq!(loaded.session_token, config.session_token);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_json_has_expected_fields() {
+        let config = make_config();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"node_id\""));
+        assert!(json.contains("\"vpn_ip\""));
+        assert!(json.contains("\"session_token\""));
+    }
+}

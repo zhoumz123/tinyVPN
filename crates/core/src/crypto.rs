@@ -39,3 +39,59 @@ pub fn random_nonce() -> [u8; 12] {
     rand::RngCore::fill_bytes(&mut OsRng, &mut nonce);
     nonce
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let (secret, _) = generate_keypair();
+        let key = secret.to_bytes();
+        let nonce = random_nonce();
+        let plaintext = b"hello tinyvpn";
+        let ciphertext = encrypt(&key, &nonce, plaintext).unwrap();
+        let decrypted = decrypt(&key, &nonce, &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn encrypt_decrypt_empty() {
+        let (secret, _) = generate_keypair();
+        let key = secret.to_bytes();
+        let nonce = random_nonce();
+        let ciphertext = encrypt(&key, &nonce, b"").unwrap();
+        let decrypted = decrypt(&key, &nonce, &ciphertext).unwrap();
+        assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn encrypt_decrypt_large() {
+        let (secret, _) = generate_keypair();
+        let key = secret.to_bytes();
+        let nonce = random_nonce();
+        let plaintext = vec![0xAB_u8; 10_000];
+        let ciphertext = encrypt(&key, &nonce, &plaintext).unwrap();
+        let decrypted = decrypt(&key, &nonce, &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let (secret1, _) = generate_keypair();
+        let (secret2, _) = generate_keypair();
+        let nonce = random_nonce();
+        let ciphertext = encrypt(&secret1.to_bytes(), &nonce, b"secret").unwrap();
+        assert!(decrypt(&secret2.to_bytes(), &nonce, &ciphertext).is_err());
+    }
+
+    #[test]
+    fn wrong_nonce_fails() {
+        let (secret, _) = generate_keypair();
+        let key = secret.to_bytes();
+        let nonce1 = random_nonce();
+        let nonce2 = random_nonce();
+        let ciphertext = encrypt(&key, &nonce1, b"secret").unwrap();
+        assert!(decrypt(&key, &nonce2, &ciphertext).is_err());
+    }
+}

@@ -126,3 +126,99 @@ fn uuid_short() -> String {
     let mut rng = rand::thread_rng();
     (0..8).map(|_| format!("{:02x}", rng.gen::<u8>())).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_registry() -> Registry {
+        Registry::new("127.0.0.1:9091".into())
+    }
+
+    #[test]
+    fn register_assigns_sequential_ips() {
+        let mut reg = new_registry();
+        let (id1, ip1, _) = reg.register("a".into(), "pk1".into());
+        let (id2, ip2, _) = reg.register("b".into(), "pk2".into());
+        assert!(id1.starts_with("node-"));
+        assert!(id2.starts_with("node-"));
+        assert_ne!(id1, id2);
+        assert_eq!(ip1, "10.13.0.1");
+        assert_eq!(ip2, "10.13.0.2");
+    }
+
+    #[test]
+    fn validate_session_correct() {
+        let mut reg = new_registry();
+        let (id, _, tok) = reg.register("a".into(), "pk1".into());
+        assert!(reg.validate_session(&id, &tok));
+    }
+
+    #[test]
+    fn validate_session_wrong_token() {
+        let mut reg = new_registry();
+        let (id, _, _) = reg.register("a".into(), "pk1".into());
+        assert!(!reg.validate_session(&id, "wrong"));
+    }
+
+    #[test]
+    fn validate_session_unknown_node() {
+        let reg = new_registry();
+        assert!(!reg.validate_session("nonexistent", "any"));
+    }
+
+    #[test]
+    fn heartbeat_refreshes() {
+        let mut reg = new_registry();
+        let (id, _, _) = reg.register("a".into(), "pk1".into());
+
+        // Simulate 61 seconds passing
+        let entry = reg.nodes.get_mut(&id).unwrap();
+        entry.last_heartbeat = Instant::now() - std::time::Duration::from_secs(61);
+
+        reg.heartbeat(&id);
+        let entry = reg.nodes.get(&id).unwrap();
+        assert!(entry.info.connected);
+        assert!(Instant::now().duration_since(entry.last_heartbeat).as_secs() < 5);
+    }
+
+    #[test]
+    fn reap_stale_marks_offline() {
+        let mut reg = new_registry();
+        let (id, _, _) = reg.register("a".into(), "pk1".into());
+
+        // Manually age the heartbeat
+        let entry = reg.nodes.get_mut(&id).unwrap();
+        entry.last_heartbeat = Instant::now() - std::time::Duration::from_secs(61);
+
+        reg.reap_stale();
+        let entry = reg.nodes.get(&id).unwrap();
+        assert!(!entry.info.connected);
+    }
+
+    #[test]
+    fn get_peers_excludes_self() {
+        let mut reg = new_registry();
+        let (id1, _, _) = reg.register("a".into(), "pk1".into());
+        let (id2, _, _) = reg.register("b".into(), "pk2".into());
+
+        let peers = reg.get_peers(Some(&id1));
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_id, id2);
+    }
+
+    #[test]
+    fn update_endpoint() {
+        let mut reg = new_registry();
+        let (id, _, _) = reg.register("a".into(), "pk1".into());
+        reg.update_endpoint(&id, "1.2.3.4:51820".into());
+        let peer = reg.get_peer(&id).unwrap();
+        assert_eq!(peer.endpoint, "1.2.3.4:51820");
+    }
+
+    #[test]
+    fn relay_addr() {
+        let reg = Registry::new("10.0.0.1:9091".into());
+        assert_eq!(reg.relay_addr(), "10.0.0.1:9091");
+    }
+}

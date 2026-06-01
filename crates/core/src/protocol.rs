@@ -72,3 +72,91 @@ pub struct PeerInfo {
     pub endpoint: String,
     pub connected: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(msg: ControlMessage) {
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&decoded).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn register_roundtrip() {
+        roundtrip(ControlMessage::Register {
+            name: "test-node".into(),
+            public_key: "abc123".into(),
+        });
+    }
+
+    #[test]
+    fn register_ok_roundtrip() {
+        roundtrip(ControlMessage::RegisterOk {
+            node_id: "node-abc".into(),
+            vpn_ip: "10.13.0.1".into(),
+            session_token: "token123".into(),
+        });
+    }
+
+    #[test]
+    fn peer_list_roundtrip() {
+        let peers = vec![
+            PeerInfo {
+                node_id: "n1".into(),
+                name: "alpha".into(),
+                vpn_ip: "10.13.0.1".into(),
+                public_key: "pub1".into(),
+                endpoint: "1.2.3.4:51820".into(),
+                connected: true,
+            },
+            PeerInfo {
+                node_id: "n2".into(),
+                name: "beta".into(),
+                vpn_ip: "10.13.0.2".into(),
+                public_key: "pub2".into(),
+                endpoint: String::new(),
+                connected: false,
+            },
+        ];
+        roundtrip(ControlMessage::PeerList { peers });
+    }
+
+    #[test]
+    fn relay_assigned_with_target() {
+        roundtrip(ControlMessage::RelayAssigned {
+            relay_addr: "1.2.3.4:9091".into(),
+            target_id: Some("node-xyz".into()),
+        });
+    }
+
+    #[test]
+    fn relay_assigned_without_target() {
+        roundtrip(ControlMessage::RelayAssigned {
+            relay_addr: "1.2.3.4:9091".into(),
+            target_id: None,
+        });
+    }
+
+    #[test]
+    fn ping_pong_roundtrip() {
+        roundtrip(ControlMessage::Ping {
+            node_id: "n1".into(),
+            session_token: "tok".into(),
+        });
+        roundtrip(ControlMessage::Pong);
+    }
+
+    #[test]
+    fn json_field_names() {
+        let msg = ControlMessage::Register {
+            name: "x".into(),
+            public_key: "y".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"name\""));
+        assert!(json.contains("\"public_key\""));
+    }
+}

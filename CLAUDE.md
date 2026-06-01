@@ -54,7 +54,7 @@ Rust workspace with 5 crates:
 
 ## Known gaps (post-MVP)
 
-- No tests
 - QUIC transport not implemented (still TCP+JSON)
-- CLI heartbeat doesn't actually send Ping packets (architectural limitation of current split-stream approach)
-- Relay session registration not wired (needs CCS → Relay coordination)
+- No TLS encryption on control plane
+- No CCS persistence (in-memory registry lost on restart)
+- IP address space not reclaimed (sequential assignment, no reuse)
