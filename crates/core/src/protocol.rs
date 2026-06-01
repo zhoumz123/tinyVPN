@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Messages sent between nodes and the control server (over QUIC)
+/// Messages sent between nodes and the control server (over TCP + JSON)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMessage {
     /// Node → CCS: Register a new node
@@ -9,14 +9,18 @@ pub enum ControlMessage {
         public_key: String,
     },
 
-    /// CCS → Node: Registration confirmed with assigned IP
+    /// CCS → Node: Registration confirmed with assigned IP + session token
     RegisterOk {
         node_id: String,
         vpn_ip: String,
+        session_token: String,
     },
 
-    /// Node → CCS: Request current peer list
-    GetPeers,
+    /// Node → CCS: Request current peer list (authenticated)
+    GetPeers {
+        node_id: String,
+        session_token: String,
+    },
 
     /// CCS → Node: Full peer list
     PeerList {
@@ -25,7 +29,21 @@ pub enum ControlMessage {
 
     /// Node → CCS: Report its current public endpoint (after STUN)
     UpdateEndpoint {
+        node_id: String,
+        session_token: String,
         public_addr: String,
+    },
+
+    /// Node → CCS: Request relay for a peer connection
+    RequestRelay {
+        node_id: String,
+        session_token: String,
+        target_id: String,
+    },
+
+    /// CCS → Node: Relay address assigned
+    RelayAssigned {
+        relay_addr: String,
     },
 
     /// CCS → Node: Signal to try hole-punching with a peer
@@ -36,7 +54,10 @@ pub enum ControlMessage {
     },
 
     /// Heartbeat
-    Ping,
+    Ping {
+        node_id: String,
+        session_token: String,
+    },
     Pong,
 }
 
@@ -47,6 +68,6 @@ pub struct PeerInfo {
     pub name: String,
     pub vpn_ip: String,
     pub public_key: String,
-    pub endpoint: String, // public ip:port (from STUN)
+    pub endpoint: String,
     pub connected: bool,
 }

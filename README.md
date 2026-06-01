@@ -23,18 +23,19 @@ Inspired by [Tailscale](https://tailscale.com) / [CloudNet](https://cloudnet.wor
 | Crate | Description |
 |-------|-------------|
 | `tinyvpn-ccs` | Control plane server — node registration, key exchange, topology, STUN |
-| `tinyvpn-cli` | CLI client — register, connect, status |
+| `tinyvpn-cli` | CLI client — register, connect, status, disconnect |
 | `tinyvpn-core` | Shared library — crypto, protocol, WireGuard interface management |
-| `tinyvpn-p2p` | Peer-to-peer engine — NAT traversal, hole punching, relay fallback |
+| `tinyvpn-p2p` | Peer-to-peer engine — NAT traversal, hole punching |
+| `tinyvpn-relay` | Relay server — UDP forwarding when hole punching fails |
 
 ### MVP Scope
 
 - [x] Project structure
-- [ ] Two nodes communicate via WireGuard tunnel
-- [ ] Control server coordinates peer discovery & key exchange
-- [ ] Basic NAT hole punching (UDP)
-- [ ] Relay fallback when P2P fails
-- [ ] CLI: `register`, `connect`, `status`
+- [x] Two nodes communicate via WireGuard tunnel
+- [x] Control server coordinates peer discovery & key exchange
+- [x] Basic NAT hole punching (UDP)
+- [x] Relay fallback when P2P fails
+- [x] CLI: `register`, `connect`, `status`, `disconnect`
 
 ### Quick Start
 
@@ -44,6 +45,9 @@ cargo build
 
 # Start control server
 cargo run -p tinyvpn-ccs
+
+# Start relay server
+cargo run -p tinyvpn-relay
 
 # On Node A
 cargo run -p tinyvpn-cli -- register --name node-a

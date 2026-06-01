@@ -13,4 +13,5 @@ anyhow = { workspace = true }
 quinn = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
+rand = { workspace = true }
 tinyvpn-core = { workspace = true }

@@ -26,6 +26,8 @@ pub struct NodeConfig {
     pub vpn_ip: String,
     /// Control server address
     pub ccs_addr: String,
+    /// Session token for authenticated requests
+    pub session_token: String,
 }
 
 impl NodeConfig {

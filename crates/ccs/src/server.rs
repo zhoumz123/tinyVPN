@@ -5,9 +5,19 @@ use tinyvpn_core::protocol::ControlMessage;
 use crate::registry::{Registry, SharedRegistry};
 
 /// Run the control server on the given address
-/// MVP: uses a simple TCP + JSON protocol (upgrade to QUIC later)
-pub async fn run(addr: &str) -> Result<()> {
-    let registry: SharedRegistry = Arc::new(RwLock::new(Registry::new()));
+pub async fn run(addr: &str, relay_addr: String) -> Result<()> {
+    let registry: SharedRegistry = Arc::new(RwLock::new(Registry::new(relay_addr)));
+
+    // Periodic stale-node reaper
+    let reap_registry = registry.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let mut reg = reap_registry.write().await;
+            reg.reap_stale();
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("CCS listening on {}", addr);
@@ -44,25 +54,58 @@ async fn handle_connection(
         let response = match msg {
             ControlMessage::Register { name, public_key } => {
                 let mut reg = registry.write().await;
-                let (node_id, vpn_ip) = reg.register(name, public_key);
+                let (node_id, vpn_ip, session_token) = reg.register(name, public_key);
                 tracing::info!("Registered node {} → {}", node_id, vpn_ip);
-                serde_json::to_string(&ControlMessage::RegisterOk { node_id, vpn_ip })?
+                serde_json::to_string(&ControlMessage::RegisterOk {
+                    node_id,
+                    vpn_ip,
+                    session_token,
+                })?
             }
 
-            ControlMessage::GetPeers => {
+            ControlMessage::GetPeers { node_id, session_token } => {
                 let reg = registry.read().await;
-                let peers = reg.get_peers(None);
-                serde_json::to_string(&ControlMessage::PeerList { peers })?
+                if !reg.validate_session(&node_id, &session_token) {
+                    serde_json::to_string(&ControlMessage::Pong)?
+                } else {
+                    let peers = reg.get_peers(Some(&node_id));
+                    serde_json::to_string(&ControlMessage::PeerList { peers })?
+                }
             }
 
-            ControlMessage::UpdateEndpoint { public_addr } => {
-                // We don't know the node_id in this simplified version
-                // In production, authenticate the connection first
-                tracing::info!("Endpoint update: {}", public_addr);
+            ControlMessage::UpdateEndpoint {
+                node_id,
+                session_token,
+                public_addr,
+            } => {
+                let mut reg = registry.write().await;
+                if reg.validate_session(&node_id, &session_token) {
+                    reg.update_endpoint(&node_id, public_addr);
+                }
                 serde_json::to_string(&ControlMessage::Pong)?
             }
 
-            ControlMessage::Ping => {
+            ControlMessage::RequestRelay {
+                node_id,
+                session_token,
+                target_id: _,
+            } => {
+                let reg = registry.read().await;
+                if reg.validate_session(&node_id, &session_token) {
+                    let relay_addr = reg.relay_addr().to_string();
+                    serde_json::to_string(&ControlMessage::RelayAssigned {
+                        relay_addr,
+                    })?
+                } else {
+                    serde_json::to_string(&ControlMessage::Pong)?
+                }
+            }
+
+            ControlMessage::Ping { node_id, session_token } => {
+                let mut reg = registry.write().await;
+                if reg.validate_session(&node_id, &session_token) {
+                    reg.heartbeat(&node_id);
+                }
                 serde_json::to_string(&ControlMessage::Pong)?
             }
 

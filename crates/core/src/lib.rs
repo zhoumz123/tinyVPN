@@ -3,5 +3,6 @@
 pub mod config;
 pub mod crypto;
 pub mod protocol;
+pub mod wg;
 
 pub use config::NodeConfig;

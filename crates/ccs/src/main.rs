@@ -1,10 +1,4 @@
 //! TinyVPN Control Coordination Server (CCS)
-//!
-//! Responsibilities:
-//! - Node registration & key exchange
-//! - Peer discovery & topology management
-//! - NAT endpoint tracking (from STUN results)
-//! - Instructing nodes to attempt hole punching
 
 mod server;
 mod registry;
@@ -20,6 +14,10 @@ async fn main() -> anyhow::Result<()> {
     let addr = std::env::var("CCS_ADDR")
         .unwrap_or_else(|_| tinyvpn_core::config::CCS_DEFAULT_ADDR.to_string());
 
-    tracing::info!("🌐 TinyVPN CCS starting on {}", addr);
-    server::run(&addr).await
+    let relay_addr = std::env::var("RELAY_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9091".to_string());
+
+    tracing::info!("TinyVPN CCS starting on {}", addr);
+    tracing::info!("Relay address: {}", relay_addr);
+    server::run(&addr, relay_addr).await
 }

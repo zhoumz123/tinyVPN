@@ -41,7 +41,7 @@ pub async fn discover_public_endpoint() -> Result<SocketAddr> {
     parse_xor_mapped_address(&buf[..n], &txn_id)
 }
 
-fn parse_xor_mapped_address(data: &[u8], txn_id: &[u8; 12]) -> Result<SocketAddr> {
+fn parse_xor_mapped_address(data: &[u8], _txn_id: &[u8; 12]) -> Result<SocketAddr> {
     // STUN header: 20 bytes, then attributes
     let msg_len = ((data[2] as u16) << 8) | data[3] as u16;
     let attrs_end = 20 + msg_len as usize;
