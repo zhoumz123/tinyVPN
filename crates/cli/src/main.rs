@@ -1,5 +1,7 @@
 //! TinyVPN CLI Client
 
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tinyvpn_core::config::NodeConfig;
@@ -131,8 +133,9 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
 
     // Step 1: Establish persistent TCP to CCS
     let stream = tokio::net::TcpStream::connect(ccs_addr).await?;
-    let (ccs_reader, mut ccs_writer) = tokio::io::split(stream);
+    let (ccs_reader, ccs_writer) = tokio::io::split(stream);
     let mut lines = tokio::io::BufReader::new(ccs_reader).lines();
+    let writer = Arc::new(Mutex::new(ccs_writer));
 
     // Step 2: STUN discover public endpoint
     println!("Discovering public endpoint via STUN...");
@@ -144,7 +147,7 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
                 session_token: config.session_token.clone(),
                 public_addr: endpoint.to_string(),
             };
-            send_on(&mut ccs_writer, &msg).await?;
+            send_shared(&writer, &msg).await?;
             let _ = lines.next_line().await?;
         }
         Err(e) => {
@@ -158,7 +161,7 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
         node_id: config.node_id.clone(),
         session_token: config.session_token.clone(),
     };
-    send_on(&mut ccs_writer, &msg).await?;
+    send_shared(&writer, &msg).await?;
 
     let peer_line = lines.next_line().await?.ok_or_else(|| anyhow::anyhow!("CCS disconnected"))?;
     let peers: Vec<tinyvpn_core::protocol::PeerInfo> = match serde_json::from_str::<ControlMessage>(&peer_line)? {
@@ -208,11 +211,18 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
                     session_token: config.session_token.clone(),
                     target_id: peer.node_id.clone(),
                 };
-                send_on(&mut ccs_writer, &relay_msg).await?;
+                send_shared(&writer, &relay_msg).await?;
                 let relay_line = lines.next_line().await?.ok_or_else(|| anyhow::anyhow!("CCS disconnected"))?;
                 match serde_json::from_str::<ControlMessage>(&relay_line)? {
-                    ControlMessage::RelayAssigned { relay_addr } => {
+                    ControlMessage::RelayAssigned { relay_addr, target_id } => {
                         println!("   Using relay {} for {}", relay_addr, peer.name);
+
+                        if let Some(tid) = target_id {
+                            if let Err(e) = register_with_relay(&relay_addr, &config.node_id, &tid).await {
+                                println!("   Warning: relay registration failed: {}", e);
+                            }
+                        }
+
                         relay_addr
                     }
                     _ => {
@@ -235,15 +245,26 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
 
     let node_id = config.node_id.clone();
     let session_token = config.session_token.clone();
+    let hb_writer = writer.clone();
 
     let heartbeat = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            // Heartbeat requires a persistent connection which we can't easily
-            // share across tasks with the current architecture.
-            // For MVP, the connection stays alive and CCS reaps after 60s timeout.
-            let _ = (node_id.clone(), session_token.clone());
+            let msg = ControlMessage::Ping {
+                node_id: node_id.clone(),
+                session_token: session_token.clone(),
+            };
+            if let Ok(data) = serde_json::to_string(&msg) {
+                let mut w = hb_writer.lock().await;
+                use tokio::io::AsyncWriteExt;
+                if w.write_all(data.as_bytes()).await.is_err()
+                    || w.write_all(b"\n").await.is_err()
+                {
+                    break;
+                }
+                let _ = w.flush().await;
+            }
         }
     });
 
@@ -323,17 +344,45 @@ async fn send_to_ccs(ccs_addr: &str, msg: &ControlMessage) -> Result<ControlMess
     Ok(msg)
 }
 
-/// Send a message on an existing TCP stream
-async fn send_on(
-    writer: &mut tokio::io::WriteHalf<tokio::net::TcpStream>,
+/// Send a message on a shared (Arc<Mutex>) writer
+async fn send_shared(
+    writer: &Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::net::TcpStream>>>,
     msg: &ControlMessage,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
+    let mut w = writer.lock().await;
     let data = serde_json::to_string(msg)?;
-    writer.write_all(data.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
+    w.write_all(data.as_bytes()).await?;
+    w.write_all(b"\n").await?;
+    w.flush().await?;
     Ok(())
+}
+
+/// Register this node with the relay server for a given peer pair
+async fn register_with_relay(relay_addr: &str, my_id: &str, peer_id: &str) -> Result<()> {
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    let relay: std::net::SocketAddr = relay_addr.parse()?;
+    let msg = format!("REGISTER:{}:{}", my_id, peer_id);
+    socket.send_to(msg.as_bytes(), relay).await?;
+
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok((n, _))) => {
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            if resp.starts_with("OK") {
+                Ok(())
+            } else {
+                anyhow::bail!("Relay rejected registration: {}", resp)
+            }
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => anyhow::bail!("Relay registration timed out"),
+    }
 }
 
 fn base64_encode(data: &[u8]) -> String {

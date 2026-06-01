@@ -44,6 +44,7 @@ pub enum ControlMessage {
     /// CCS → Node: Relay address assigned
     RelayAssigned {
         relay_addr: String,
+        target_id: Option<String>,
     },
 
     /// CCS → Node: Signal to try hole-punching with a peer

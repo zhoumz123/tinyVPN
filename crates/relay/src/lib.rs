@@ -17,9 +17,16 @@ struct Session {
     last_activity: Instant,
 }
 
+/// Pending registration: node_id waiting for its peer to also register
+struct PendingReg {
+    addr: SocketAddr,
+}
+
 pub struct Relay {
     socket: Arc<UdpSocket>,
     sessions: Arc<Mutex<HashMap<SocketAddr, Session>>>,
+    /// (my_node_id, peer_node_id) -> registered address
+    pending: Arc<Mutex<HashMap<(String, String), PendingReg>>>,
 }
 
 impl Relay {
@@ -29,6 +36,7 @@ impl Relay {
         Ok(Self {
             socket: Arc::new(socket),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -72,15 +80,28 @@ impl Relay {
             }
         });
 
-        // Forwarding loop
+        // Forwarding + registration loop
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             let (n, from) = self.socket.recv_from(&mut buf).await?;
+            let msg = String::from_utf8_lossy(&buf[..n]);
+
+            if let Some(rest) = msg.strip_prefix("REGISTER:") {
+                let parts: Vec<&str> = rest.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    let my_id = parts[0].to_string();
+                    let peer_id = parts[1].to_string();
+                    self.handle_register(from, my_id, peer_id).await;
+                }
+                self.socket.send_to(b"OK", from).await?;
+                continue;
+            }
+
+            // Normal forwarding
             let sessions = self.sessions.lock().await;
 
             if let Some(_session) = sessions.get(&from) {
                 drop(sessions);
-                // Update activity timestamp
                 let mut sessions = self.sessions.lock().await;
                 if let Some(session) = sessions.get_mut(&from) {
                     session.last_activity = Instant::now();
@@ -98,5 +119,29 @@ impl Relay {
                 tracing::warn!("Packet from unknown address: {}", from);
             }
         }
+    }
+
+    async fn handle_register(&self, from: SocketAddr, my_id: String, peer_id: String) {
+        let mut pending = self.pending.lock().await;
+
+        let pair_key = (peer_id.clone(), my_id.clone());
+        if let Some(existing) = pending.remove(&pair_key) {
+            drop(pending);
+            tracing::info!(
+                "Pair complete: {} ({}) <-> {} ({})",
+                my_id, from, peer_id, existing.addr
+            );
+            self.register_session(from, existing.addr).await;
+            return;
+        }
+
+        let reverse_key = (my_id.clone(), peer_id.clone());
+        pending.insert(
+            reverse_key,
+            PendingReg {
+                addr: from,
+            },
+        );
+        tracing::info!("Registered {} -> {} (waiting for peer)", my_id, peer_id);
     }
 }

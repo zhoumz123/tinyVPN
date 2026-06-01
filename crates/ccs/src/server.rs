@@ -88,13 +88,14 @@ async fn handle_connection(
             ControlMessage::RequestRelay {
                 node_id,
                 session_token,
-                target_id: _,
+                target_id,
             } => {
                 let reg = registry.read().await;
                 if reg.validate_session(&node_id, &session_token) {
                     let relay_addr = reg.relay_addr().to_string();
                     serde_json::to_string(&ControlMessage::RelayAssigned {
                         relay_addr,
+                        target_id: Some(target_id),
                     })?
                 } else {
                     serde_json::to_string(&ControlMessage::Pong)?
