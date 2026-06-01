@@ -7,7 +7,7 @@ use tinyvpn_core::crypto::generate_keypair;
 use tinyvpn_core::protocol::ControlMessage;
 use tinyvpn_core::wg::WgInterface;
 
-const WG_INTERFACE: &str = "wg0";
+const DEFAULT_WG_INTERFACE: &str = "wg-tinyvpn";
 const WG_LISTEN_PORT: u16 = 51820;
 
 #[derive(Parser)]
@@ -20,6 +20,14 @@ struct Cli {
     /// Control server address
     #[arg(long, default_value = "127.0.0.1:9090")]
     ccs: String,
+
+    /// WireGuard interface name
+    #[arg(long, default_value = DEFAULT_WG_INTERFACE)]
+    interface: String,
+
+    /// WireGuard listen port
+    #[arg(long, default_value_t = WG_LISTEN_PORT)]
+    port: u16,
 }
 
 #[derive(Subcommand)]
@@ -54,9 +62,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Register { name } => register(&cli.ccs, &name).await,
-        Commands::Connect => connect(&cli.ccs).await,
+        Commands::Connect => connect(&cli.ccs, &cli.interface, cli.port).await,
         Commands::Status => status(&cli.ccs).await,
-        Commands::Disconnect => disconnect().await,
+        Commands::Disconnect => disconnect(&cli.interface).await,
     }
 }
 
@@ -112,7 +120,7 @@ async fn register(ccs_addr: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn connect(ccs_addr: &str) -> Result<()> {
+async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()> {
     use tokio::io::AsyncBufReadExt;
 
     let config = NodeConfig::load().map_err(|_| {
@@ -173,9 +181,9 @@ async fn connect(ccs_addr: &str) -> Result<()> {
     }
 
     // Step 4: Setup WireGuard interface
-    println!("Setting up WireGuard interface {}...", WG_INTERFACE);
-    let wg = WgInterface::new(WG_INTERFACE);
-    wg.setup(&config.vpn_ip, &config.private_key, WG_LISTEN_PORT)?;
+    println!("Setting up WireGuard interface {}...", wg_interface);
+    let wg = WgInterface::new(wg_interface);
+    wg.setup(&config.vpn_ip, &config.private_key, wg_port)?;
 
     // Step 5: Connect to each peer
     for peer in &peers {
@@ -287,8 +295,8 @@ async fn status(ccs_addr: &str) -> Result<()> {
     Ok(())
 }
 
-async fn disconnect() -> Result<()> {
-    let wg = WgInterface::new(WG_INTERFACE);
+async fn disconnect(wg_interface: &str) -> Result<()> {
+    let wg = WgInterface::new(wg_interface);
     match wg.teardown() {
         Ok(()) => println!("WireGuard interface torn down."),
         Err(e) => println!("Teardown failed (may already be down): {}", e),
