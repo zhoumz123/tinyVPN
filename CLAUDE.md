@@ -28,15 +28,15 @@ Rust workspace with 5 crates:
 
 | Crate | Purpose |
 |---|---|
-| `tinyvpn-core` | Shared library: crypto (x25519 keygen, ChaCha20-Poly1305 encrypt/decrypt), protocol types (`ControlMessage` enum with session auth, `PeerInfo`), config (`NodeConfig` with session_token, persisted at `~/.tinyvpn/config.json`), WireGuard interface management (`WgInterface` via wg-quick) |
-| `tinyvpn-ccs` | Control Coordination Server: node registry (in-memory `HashMap` with session tokens), IP assignment from `10.13.0.0/16`, peer discovery, heartbeat tracking (60s timeout), stale node reaper. Uses TCP + newline-delimited JSON |
+| `tinyvpn-core` | Shared library: crypto (x25519 keygen, ChaCha20-Poly1305 encrypt/decrypt), protocol types (`ControlMessage` enum with session auth, `PeerInfo`), config (`NodeConfig` with session_token, persisted at `~/.tinyvpn/config.json`), TLS helpers (`create_server`/`create_client` for QUIC self-signed certs), WireGuard interface management (`WgInterface` via wg-quick) |
+| `tinyvpn-ccs` | Control Coordination Server: node registry (in-memory `HashMap` with session tokens), IP assignment from `10.13.0.0/16`, peer discovery, heartbeat tracking (60s timeout), stale node reaper. Uses QUIC + newline-delimited JSON |
 | `tinyvpn-p2p` | P2P engine: STUN public endpoint discovery (raw RFC 5389 binding request to Google STUN), UDP hole punching (`Puncher` sends 10 probe packets) |
 | `tinyvpn-relay` | Relay server: UDP packet forwarding when hole punching fails. Bidirectional session mapping with 30s timeout |
 | `tinyvpn-cli` | CLI client: `register`, `connect`, `status`, `disconnect` subcommands via clap |
 
 ### Data flow
 
-1. Node generates X25519 keypair, sends `Register` to CCS over TCP
+1. Node generates X25519 keypair, sends `Register` to CCS over QUIC
 2. CCS assigns VPN IP (sequential from `10.13.0.1`), returns `RegisterOk` with session_token
 3. On `connect`, node establishes persistent TCP to CCS, does STUN to discover public endpoint, reports it to CCS
 4. Node fetches peer list (authenticated), sets up WireGuard interface via wg-quick
@@ -54,7 +54,7 @@ Rust workspace with 5 crates:
 
 ## Known gaps (post-MVP)
 
-- QUIC transport not implemented (still TCP+JSON)
-- No TLS encryption on control plane
 - No CCS persistence (in-memory registry lost on restart)
 - IP address space not reclaimed (sequential assignment, no reuse)
+- TLS uses self-signed certs (no proper CA/PKI)
+- QUIC stream-per-connection (not leveraging multiplexing yet)

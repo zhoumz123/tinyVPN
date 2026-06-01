@@ -1204,6 +1204,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "quinn",
+ "rustls",
  "serde",
  "serde_json",
  "tinyvpn-core",
@@ -1219,10 +1221,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
+ "quinn",
  "rand 0.8.6",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "x25519-dalek",
 ]

@@ -131,21 +131,22 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
 
     println!("Connecting as {} ({})...", config.name, config.vpn_ip);
 
-    // Step 1: Establish persistent TCP to CCS
-    let stream = tokio::net::TcpStream::connect(ccs_addr).await?;
-    let (ccs_reader, ccs_writer) = tokio::io::split(stream);
-    let mut lines = tokio::io::BufReader::new(ccs_reader).lines();
-    let writer = Arc::new(Mutex::new(ccs_writer));
+    // Step 1: Establish QUIC connection to CCS
+    let endpoint = tinyvpn_core::tls::create_client()?;
+    let conn = endpoint.connect(ccs_addr.parse()?, "localhost")?.await?;
+    let (send, recv) = conn.open_bi().await?;
+    let mut lines = tokio::io::BufReader::new(recv).lines();
+    let writer = Arc::new(Mutex::new(send));
 
     // Step 2: STUN discover public endpoint
     println!("Discovering public endpoint via STUN...");
     match tinyvpn_p2p::discover_public_endpoint().await {
-        Ok(endpoint) => {
-            println!("   Public endpoint: {}", endpoint);
+        Ok(stun_endpoint) => {
+            println!("   Public endpoint: {}", stun_endpoint);
             let msg = ControlMessage::UpdateEndpoint {
                 node_id: config.node_id.clone(),
                 session_token: config.session_token.clone(),
-                public_addr: endpoint.to_string(),
+                public_addr: stun_endpoint.to_string(),
             };
             send_shared(&writer, &msg).await?;
             let _ = lines.next_line().await?;
@@ -325,18 +326,19 @@ async fn disconnect(wg_interface: &str) -> Result<()> {
     Ok(())
 }
 
-/// Send a control message to CCS (one-shot TCP + newline-delimited JSON)
+/// Send a control message to CCS (one-shot QUIC + newline-delimited JSON)
 async fn send_to_ccs(ccs_addr: &str, msg: &ControlMessage) -> Result<ControlMessage> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let stream = tokio::net::TcpStream::connect(ccs_addr).await?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    let endpoint = tinyvpn_core::tls::create_client()?;
+    let conn = endpoint.connect(ccs_addr.parse()?, "localhost")?.await?;
+    let (mut send, recv) = conn.open_bi().await?;
+    let mut reader = BufReader::new(recv);
 
     let data = serde_json::to_string(msg)?;
-    writer.write_all(data.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
+    send.write_all(data.as_bytes()).await?;
+    send.write_all(b"\n").await?;
+    send.flush().await?;
 
     let mut response = String::new();
     reader.read_line(&mut response).await?;
@@ -344,9 +346,9 @@ async fn send_to_ccs(ccs_addr: &str, msg: &ControlMessage) -> Result<ControlMess
     Ok(msg)
 }
 
-/// Send a message on a shared (Arc<Mutex>) writer
+/// Send a message on a shared (Arc<Mutex>) QUIC send stream
 async fn send_shared(
-    writer: &Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::net::TcpStream>>>,
+    writer: &Arc<tokio::sync::Mutex<quinn::SendStream>>,
     msg: &ControlMessage,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;

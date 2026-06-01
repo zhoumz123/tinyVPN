@@ -4,7 +4,7 @@ use anyhow::Result;
 use tinyvpn_core::protocol::ControlMessage;
 use crate::registry::{Registry, SharedRegistry};
 
-/// Run the control server on the given address
+/// Run the control server on the given address (QUIC transport)
 pub async fn run(addr: &str, relay_addr: String) -> Result<()> {
     let registry: SharedRegistry = Arc::new(RwLock::new(Registry::new(relay_addr)));
 
@@ -19,23 +19,30 @@ pub async fn run(addr: &str, relay_addr: String) -> Result<()> {
         }
     });
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let endpoint = tinyvpn_core::tls::create_server(addr)?;
     tracing::info!("CCS listening on {}", addr);
 
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let incoming = endpoint.accept().await;
+        let conn = match incoming {
+            Some(incoming) => incoming.await?,
+            None => break,
+        };
+        let peer_addr = conn.remote_address();
         let registry = registry.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer_addr, registry).await {
+            if let Err(e) = handle_connection(conn, peer_addr, registry).await {
                 tracing::warn!("Connection from {} error: {}", peer_addr, e);
             }
         });
     }
+
+    Ok(())
 }
 
 async fn handle_connection(
-    stream: tokio::net::TcpStream,
+    conn: quinn::Connection,
     peer_addr: std::net::SocketAddr,
     registry: SharedRegistry,
 ) -> Result<()> {
@@ -43,8 +50,9 @@ async fn handle_connection(
 
     tracing::info!("New connection from {}", peer_addr);
 
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    // Accept a bidirectional stream from the client
+    let (mut writer, recv) = conn.accept_bi().await?;
+    let mut reader = BufReader::new(recv);
     let mut line = String::new();
 
     while reader.read_line(&mut line).await? > 0 {
