@@ -4,11 +4,9 @@ use anyhow::Result;
 use tinyvpn_core::protocol::ControlMessage;
 use crate::registry::{Registry, SharedRegistry};
 
-/// Run the control server on the given address (QUIC transport)
 pub async fn run(addr: &str, relay_addr: String) -> Result<()> {
     let registry: SharedRegistry = Arc::new(RwLock::new(Registry::new(relay_addr)?));
 
-    // Periodic stale-node reaper
     let reap_registry = registry.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -31,105 +29,116 @@ pub async fn run(addr: &str, relay_addr: String) -> Result<()> {
         let peer_addr = conn.remote_address();
         let registry = registry.clone();
 
+        tracing::info!("New connection from {}", peer_addr);
+
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(conn, peer_addr, registry).await {
-                tracing::warn!("Connection from {} error: {}", peer_addr, e);
+            loop {
+                let (send, recv) = match conn.accept_bi().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let registry = registry.clone();
+                let peer_addr = peer_addr;
+
+                tokio::spawn(async move {
+                    if let Err(e) = handle_stream(send, recv, peer_addr, registry).await {
+                        tracing::debug!("Stream from {} error: {}", peer_addr, e);
+                    }
+                });
             }
+            tracing::info!("Connection closed from {}", peer_addr);
         });
     }
 
     Ok(())
 }
 
-async fn handle_connection(
-    conn: quinn::Connection,
+async fn handle_stream(
+    mut send: quinn::SendStream,
+    recv: quinn::RecvStream,
     peer_addr: std::net::SocketAddr,
     registry: SharedRegistry,
 ) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
-    tracing::info!("New connection from {}", peer_addr);
-
-    // Accept a bidirectional stream from the client
-    let (mut writer, recv) = conn.accept_bi().await?;
     let mut reader = BufReader::new(recv);
     let mut line = String::new();
 
-    while reader.read_line(&mut line).await? > 0 {
-        let msg: ControlMessage = serde_json::from_str(line.trim())?;
-        tracing::debug!("Received from {}: {:?}", peer_addr, msg);
-
-        let response = match msg {
-            ControlMessage::Register { name, public_key } => {
-                let mut reg = registry.write().await;
-                let (node_id, vpn_ip, session_token) = reg.register(name, public_key)?;
-                tracing::info!("Registered node {} → {}", node_id, vpn_ip);
-                serde_json::to_string(&ControlMessage::RegisterOk {
-                    node_id,
-                    vpn_ip,
-                    session_token,
-                })?
-            }
-
-            ControlMessage::GetPeers { node_id, session_token } => {
-                let reg = registry.read().await;
-                if !reg.validate_session(&node_id, &session_token) {
-                    serde_json::to_string(&ControlMessage::Pong)?
-                } else {
-                    let peers = reg.get_peers(Some(&node_id));
-                    serde_json::to_string(&ControlMessage::PeerList { peers })?
-                }
-            }
-
-            ControlMessage::UpdateEndpoint {
-                node_id,
-                session_token,
-                public_addr,
-            } => {
-                let mut reg = registry.write().await;
-                if reg.validate_session(&node_id, &session_token) {
-                    reg.update_endpoint(&node_id, public_addr);
-                }
-                serde_json::to_string(&ControlMessage::Pong)?
-            }
-
-            ControlMessage::RequestRelay {
-                node_id,
-                session_token,
-                target_id,
-            } => {
-                let reg = registry.read().await;
-                if reg.validate_session(&node_id, &session_token) {
-                    let relay_addr = reg.relay_addr().to_string();
-                    serde_json::to_string(&ControlMessage::RelayAssigned {
-                        relay_addr,
-                        target_id: Some(target_id),
-                    })?
-                } else {
-                    serde_json::to_string(&ControlMessage::Pong)?
-                }
-            }
-
-            ControlMessage::Ping { node_id, session_token } => {
-                let mut reg = registry.write().await;
-                if reg.validate_session(&node_id, &session_token) {
-                    reg.heartbeat(&node_id);
-                }
-                serde_json::to_string(&ControlMessage::Pong)?
-            }
-
-            _ => {
-                tracing::warn!("Unhandled message type from {}", peer_addr);
-                serde_json::to_string(&ControlMessage::Pong)?
-            }
-        };
-
-        writer.write_all(response.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
-        line.clear();
+    if reader.read_line(&mut line).await? == 0 {
+        return Ok(());
     }
 
-    tracing::info!("Connection closed from {}", peer_addr);
+    let msg: ControlMessage = serde_json::from_str(line.trim())?;
+    tracing::debug!("Received from {}: {:?}", peer_addr, msg);
+
+    let response = match msg {
+        ControlMessage::Register { name, public_key } => {
+            let mut reg = registry.write().await;
+            let (node_id, vpn_ip, session_token) = reg.register(name, public_key)?;
+            tracing::info!("Registered node {} → {}", node_id, vpn_ip);
+            serde_json::to_string(&ControlMessage::RegisterOk {
+                node_id,
+                vpn_ip,
+                session_token,
+            })?
+        }
+
+        ControlMessage::GetPeers { node_id, session_token } => {
+            let reg = registry.read().await;
+            if !reg.validate_session(&node_id, &session_token) {
+                serde_json::to_string(&ControlMessage::Pong)?
+            } else {
+                let peers = reg.get_peers(Some(&node_id));
+                serde_json::to_string(&ControlMessage::PeerList { peers })?
+            }
+        }
+
+        ControlMessage::UpdateEndpoint {
+            node_id,
+            session_token,
+            public_addr,
+        } => {
+            let mut reg = registry.write().await;
+            if reg.validate_session(&node_id, &session_token) {
+                reg.update_endpoint(&node_id, public_addr);
+            }
+            serde_json::to_string(&ControlMessage::Pong)?
+        }
+
+        ControlMessage::RequestRelay {
+            node_id,
+            session_token,
+            target_id,
+        } => {
+            let reg = registry.read().await;
+            if reg.validate_session(&node_id, &session_token) {
+                let relay_addr = reg.relay_addr().to_string();
+                serde_json::to_string(&ControlMessage::RelayAssigned {
+                    relay_addr,
+                    target_id: Some(target_id),
+                })?
+            } else {
+                serde_json::to_string(&ControlMessage::Pong)?
+            }
+        }
+
+        ControlMessage::Ping { node_id, session_token } => {
+            let mut reg = registry.write().await;
+            if reg.validate_session(&node_id, &session_token) {
+                reg.heartbeat(&node_id);
+            }
+            serde_json::to_string(&ControlMessage::Pong)?
+        }
+
+        _ => {
+            tracing::warn!("Unhandled message type from {}", peer_addr);
+            serde_json::to_string(&ControlMessage::Pong)?
+        }
+    };
+
+    send.write_all(response.as_bytes()).await?;
+    send.write_all(b"\n").await?;
+    send.finish()?;
+
     Ok(())
 }

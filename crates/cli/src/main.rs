@@ -1,7 +1,6 @@
 //! TinyVPN CLI Client
 
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tinyvpn_core::config::NodeConfig;
@@ -34,20 +33,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Register this node with the control server
     Register {
-        /// Human-readable name for this node
         #[arg(short, long)]
         name: String,
     },
-
-    /// Connect to the mesh network
     Connect,
-
-    /// Show network status and peer list
     Status,
-
-    /// Disconnect from the mesh and tear down WireGuard
     Disconnect,
 }
 
@@ -73,11 +64,7 @@ async fn main() -> Result<()> {
 async fn register(ccs_addr: &str, name: &str) -> Result<()> {
     if NodeConfig::exists() {
         let existing = NodeConfig::load()?;
-        anyhow::bail!(
-            "Node already registered: {} ({})",
-            existing.name,
-            existing.node_id
-        );
+        anyhow::bail!("Node already registered: {} ({})", existing.name, existing.node_id);
     }
 
     println!("Generating WireGuard keypair...");
@@ -86,21 +73,13 @@ async fn register(ccs_addr: &str, name: &str) -> Result<()> {
     let private_key_b64 = base64_encode(secret.to_bytes().as_ref());
 
     println!("Registering with CCS at {}...", ccs_addr);
-    let response = send_to_ccs(
-        ccs_addr,
-        &ControlMessage::Register {
-            name: name.to_string(),
-            public_key: public_key_b64.clone(),
-        },
-    )
-    .await?;
+    let response = rpc(ccs_addr, &ControlMessage::Register {
+        name: name.to_string(),
+        public_key: public_key_b64.clone(),
+    }).await?;
 
     match response {
-        ControlMessage::RegisterOk {
-            node_id,
-            vpn_ip,
-            session_token,
-        } => {
+        ControlMessage::RegisterOk { node_id, vpn_ip, session_token } => {
             let config = NodeConfig {
                 node_id,
                 name: name.to_string(),
@@ -110,7 +89,6 @@ async fn register(ccs_addr: &str, name: &str) -> Result<()> {
                 session_token,
             };
             config.save()?;
-
             println!("Registered!");
             println!("   Node ID: {}", config.node_id);
             println!("   VPN IP:  {}", config.vpn_ip);
@@ -123,49 +101,37 @@ async fn register(ccs_addr: &str, name: &str) -> Result<()> {
 }
 
 async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()> {
-    use tokio::io::AsyncBufReadExt;
-
     let config = NodeConfig::load().map_err(|_| {
         anyhow::anyhow!("Not registered yet. Run: tinyvpn register --name <name>")
     })?;
 
     println!("Connecting as {} ({})...", config.name, config.vpn_ip);
 
-    // Step 1: Establish QUIC connection to CCS
     let endpoint = tinyvpn_core::tls::create_client()?;
-    let conn = endpoint.connect(ccs_addr.parse()?, "localhost")?.await?;
-    let (send, recv) = conn.open_bi().await?;
-    let mut lines = tokio::io::BufReader::new(recv).lines();
-    let writer = Arc::new(Mutex::new(send));
+    let conn = Arc::new(endpoint.connect(ccs_addr.parse()?, "localhost")?.await?);
 
-    // Step 2: STUN discover public endpoint
     println!("Discovering public endpoint via STUN...");
     match tinyvpn_p2p::discover_public_endpoint().await {
         Ok(stun_endpoint) => {
             println!("   Public endpoint: {}", stun_endpoint);
-            let msg = ControlMessage::UpdateEndpoint {
+            conn_rpc(&conn, &ControlMessage::UpdateEndpoint {
                 node_id: config.node_id.clone(),
                 session_token: config.session_token.clone(),
                 public_addr: stun_endpoint.to_string(),
-            };
-            send_shared(&writer, &msg).await?;
-            let _ = lines.next_line().await?;
+            }).await?;
         }
         Err(e) => {
             println!("   STUN failed: {} (will rely on relay)", e);
         }
     }
 
-    // Step 3: Get peer list
     println!("Fetching peer list...");
-    let msg = ControlMessage::GetPeers {
+    let response = conn_rpc(&conn, &ControlMessage::GetPeers {
         node_id: config.node_id.clone(),
         session_token: config.session_token.clone(),
-    };
-    send_shared(&writer, &msg).await?;
+    }).await?;
 
-    let peer_line = lines.next_line().await?.ok_or_else(|| anyhow::anyhow!("CCS disconnected"))?;
-    let peers: Vec<tinyvpn_core::protocol::PeerInfo> = match serde_json::from_str::<ControlMessage>(&peer_line)? {
+    let peers = match response {
         ControlMessage::PeerList { peers } => peers,
         other => anyhow::bail!("Unexpected response: {:?}", other),
     };
@@ -175,21 +141,15 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
     } else {
         println!("   Found {} peer(s):", peers.len());
         for peer in &peers {
-            println!(
-                "   - {} ({}) [{}]",
-                peer.name,
-                peer.vpn_ip,
-                if peer.connected { "online" } else { "offline" }
-            );
+            println!("   - {} ({}) [{}]", peer.name, peer.vpn_ip,
+                if peer.connected { "online" } else { "offline" });
         }
     }
 
-    // Step 4: Setup WireGuard interface
     println!("Setting up WireGuard interface {}...", wg_interface);
     let wg = WgInterface::new(wg_interface);
     wg.setup(&config.vpn_ip, &config.private_key, wg_port)?;
 
-    // Step 5: Connect to each peer
     for peer in &peers {
         if peer.endpoint.is_empty() {
             println!("   Skipping {} (no public endpoint yet)", peer.name);
@@ -207,23 +167,19 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
             }
             Err(_) => {
                 println!("   Punch failed, requesting relay for {}...", peer.name);
-                let relay_msg = ControlMessage::RequestRelay {
+                let resp = conn_rpc(&conn, &ControlMessage::RequestRelay {
                     node_id: config.node_id.clone(),
                     session_token: config.session_token.clone(),
                     target_id: peer.node_id.clone(),
-                };
-                send_shared(&writer, &relay_msg).await?;
-                let relay_line = lines.next_line().await?.ok_or_else(|| anyhow::anyhow!("CCS disconnected"))?;
-                match serde_json::from_str::<ControlMessage>(&relay_line)? {
+                }).await?;
+                match resp {
                     ControlMessage::RelayAssigned { relay_addr, target_id } => {
                         println!("   Using relay {} for {}", relay_addr, peer.name);
-
                         if let Some(tid) = target_id {
                             if let Err(e) = register_with_relay(&relay_addr, &config.node_id, &tid).await {
                                 println!("   Warning: relay registration failed: {}", e);
                             }
                         }
-
                         relay_addr
                     }
                     _ => {
@@ -234,19 +190,17 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
             }
         };
 
-        // Add WireGuard peer
         let allowed_ip = format!("{}/32", peer.vpn_ip);
         if let Err(e) = wg.add_peer(&peer.public_key, &allowed_ip, Some(&peer_endpoint)) {
             println!("   Failed to add WG peer {}: {}", peer.name, e);
         }
     }
 
-    // Step 6: Heartbeat loop + wait for Ctrl+C
     println!("TinyVPN is running. Press Ctrl+C to stop.");
 
     let node_id = config.node_id.clone();
     let session_token = config.session_token.clone();
-    let hb_writer = writer.clone();
+    let hb_conn = conn.clone();
 
     let heartbeat = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -256,16 +210,7 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
                 node_id: node_id.clone(),
                 session_token: session_token.clone(),
             };
-            if let Ok(data) = serde_json::to_string(&msg) {
-                let mut w = hb_writer.lock().await;
-                use tokio::io::AsyncWriteExt;
-                if w.write_all(data.as_bytes()).await.is_err()
-                    || w.write_all(b"\n").await.is_err()
-                {
-                    break;
-                }
-                let _ = w.flush().await;
-            }
+            let _ = conn_rpc(&hb_conn, &msg).await;
         }
     });
 
@@ -285,30 +230,18 @@ async fn status(ccs_addr: &str) -> Result<()> {
     println!("Node: {} ({})", config.name, config.node_id);
     println!("   VPN IP: {}", config.vpn_ip);
 
-    let response = send_to_ccs(
-        ccs_addr,
-        &ControlMessage::GetPeers {
-            node_id: config.node_id,
-            session_token: config.session_token,
-        },
-    )
-    .await?;
+    let response = rpc(ccs_addr, &ControlMessage::GetPeers {
+        node_id: config.node_id,
+        session_token: config.session_token,
+    }).await?;
 
     match response {
         ControlMessage::PeerList { peers } => {
             println!("   Peers: {} online", peers.len());
             for peer in &peers {
-                println!(
-                    "   - {} ({}) → {} [{}]",
-                    peer.name,
-                    peer.vpn_ip,
-                    if peer.endpoint.is_empty() {
-                        "unknown"
-                    } else {
-                        &peer.endpoint
-                    },
-                    if peer.connected { "online" } else { "offline" }
-                );
+                println!("   - {} ({}) → {} [{}]", peer.name, peer.vpn_ip,
+                    if peer.endpoint.is_empty() { "unknown" } else { &peer.endpoint },
+                    if peer.connected { "online" } else { "offline" });
             }
         }
         other => println!("   Error: {:?}", other),
@@ -326,9 +259,9 @@ async fn disconnect(wg_interface: &str) -> Result<()> {
     Ok(())
 }
 
-/// Send a control message to CCS (one-shot QUIC + newline-delimited JSON)
-async fn send_to_ccs(ccs_addr: &str, msg: &ControlMessage) -> Result<ControlMessage> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+/// One-shot RPC: create endpoint, connect, open stream, send, receive
+async fn rpc(ccs_addr: &str, msg: &ControlMessage) -> Result<ControlMessage> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     let endpoint = tinyvpn_core::tls::create_client()?;
     let conn = endpoint.connect(ccs_addr.parse()?, "localhost")?.await?;
@@ -338,7 +271,7 @@ async fn send_to_ccs(ccs_addr: &str, msg: &ControlMessage) -> Result<ControlMess
     let data = serde_json::to_string(msg)?;
     send.write_all(data.as_bytes()).await?;
     send.write_all(b"\n").await?;
-    send.flush().await?;
+    send.finish()?;
 
     let mut response = String::new();
     reader.read_line(&mut response).await?;
@@ -346,21 +279,24 @@ async fn send_to_ccs(ccs_addr: &str, msg: &ControlMessage) -> Result<ControlMess
     Ok(msg)
 }
 
-/// Send a message on a shared (Arc<Mutex>) QUIC send stream
-async fn send_shared(
-    writer: &Arc<tokio::sync::Mutex<quinn::SendStream>>,
-    msg: &ControlMessage,
-) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut w = writer.lock().await;
+/// RPC on an existing connection: open stream, send, receive
+async fn conn_rpc(conn: &quinn::Connection, msg: &ControlMessage) -> Result<ControlMessage> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let (mut send, recv) = conn.open_bi().await?;
+    let mut reader = BufReader::new(recv);
+
     let data = serde_json::to_string(msg)?;
-    w.write_all(data.as_bytes()).await?;
-    w.write_all(b"\n").await?;
-    w.flush().await?;
-    Ok(())
+    send.write_all(data.as_bytes()).await?;
+    send.write_all(b"\n").await?;
+    send.finish()?;
+
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    let msg: ControlMessage = serde_json::from_str(response.trim())?;
+    Ok(msg)
 }
 
-/// Register this node with the relay server for a given peer pair
 async fn register_with_relay(relay_addr: &str, my_id: &str, peer_id: &str) -> Result<()> {
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
     let relay: std::net::SocketAddr = relay_addr.parse()?;
@@ -368,19 +304,10 @@ async fn register_with_relay(relay_addr: &str, my_id: &str, peer_id: &str) -> Re
     socket.send_to(msg.as_bytes(), relay).await?;
 
     let mut buf = [0u8; 64];
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        socket.recv_from(&mut buf),
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv_from(&mut buf)).await {
         Ok(Ok((n, _))) => {
             let resp = String::from_utf8_lossy(&buf[..n]);
-            if resp.starts_with("OK") {
-                Ok(())
-            } else {
-                anyhow::bail!("Relay rejected registration: {}", resp)
-            }
+            if resp.starts_with("OK") { Ok(()) } else { anyhow::bail!("Relay rejected: {}", resp) }
         }
         Ok(Err(e)) => Err(e.into()),
         Err(_) => anyhow::bail!("Relay registration timed out"),
@@ -390,25 +317,15 @@ async fn register_with_relay(relay_addr: &str, my_id: &str, peer_id: &str) -> Re
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::new();
-    let chunks = data.chunks(3);
-    for chunk in chunks {
+    for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
         let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
         let triple = (b0 << 16) | (b1 << 8) | b2;
-
         result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
         result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        if chunk.len() > 2 {
-            result.push(CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
+        result.push(if chunk.len() > 1 { CHARS[((triple >> 6) & 0x3F) as usize] as char } else { '=' });
+        result.push(if chunk.len() > 2 { CHARS[(triple & 0x3F) as usize] as char } else { '=' });
     }
     result
 }
