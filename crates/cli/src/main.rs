@@ -40,6 +40,16 @@ enum Commands {
     Connect,
     Status,
     Disconnect,
+
+    /// Forward a TCP port on the VPN IP to a local service
+    Forward {
+        /// Port to listen on the VPN interface
+        port: u16,
+
+        /// Target address to forward to (default: 127.0.0.1:<port>)
+        #[arg(short, long)]
+        target: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -58,6 +68,7 @@ async fn main() -> Result<()> {
         Commands::Connect => connect(&cli.ccs, &cli.interface, cli.port).await,
         Commands::Status => status(&cli.ccs).await,
         Commands::Disconnect => disconnect(&cli.interface).await,
+        Commands::Forward { port, target } => forward(port, target).await,
     }
 }
 
@@ -246,6 +257,42 @@ async fn status(ccs_addr: &str) -> Result<()> {
         }
         other => println!("   Error: {:?}", other),
     }
+
+    Ok(())
+}
+
+async fn forward(port: u16, target: Option<String>) -> Result<()> {
+    let config = NodeConfig::load().map_err(|_| {
+        anyhow::anyhow!("Not registered yet. Run: tinyvpn register --name <name>")
+    })?;
+
+    let target_addr = target.unwrap_or_else(|| format!("127.0.0.1:{}", port));
+    let listen_addr = format!("{}:{}", config.vpn_ip, port);
+
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    println!("Forwarding {} -> {}", listen_addr, target_addr);
+    println!("Press Ctrl+C to stop.");
+
+    loop {
+        let (client, client_addr) = listener.accept().await?;
+        let target = target_addr.clone();
+        tokio::spawn(async move {
+            if let Err(e) = proxy_connection(client, &target).await {
+                tracing::debug!("Proxy {} -> {} error: {}", client_addr, target, e);
+            }
+        });
+    }
+}
+
+async fn proxy_connection(client: tokio::net::TcpStream, target: &str) -> Result<()> {
+    let server = tokio::net::TcpStream::connect(target).await?;
+    let (mut cr, mut cw) = tokio::io::split(client);
+    let (mut sr, mut sw) = tokio::io::split(server);
+
+    tokio::select! {
+        r = tokio::io::copy(&mut cr, &mut sw) => r?,
+        r = tokio::io::copy(&mut sr, &mut cw) => r?,
+    };
 
     Ok(())
 }
