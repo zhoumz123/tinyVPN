@@ -5,7 +5,7 @@
 - **操作系统：** Linux（内核 ≥ 5.6，支持 WireGuard 模块）
 - **软件依赖：** `wireguard-tools`（提供 `wg`、`wg-quick` 命令）
 - **权限：** root（WireGuard 接口管理需要特权）
-- **网络：** 节点需要能访问 CCS 服务器和公网 STUN 服务器
+- **网络：** 节点需要能访问 CCS 服务器（QUIC :9090）和公网 STUN 服务器
 
 ## 安装
 
@@ -21,7 +21,7 @@ apt install wireguard-tools   # Debian/Ubuntu
 yum install wireguard-tools   # CentOS/RHEL
 
 # 编译 TinyVPN
-git clone <repo-url> && cd tinyvpn
+git clone https://github.com/zhoumz123/tinyvpn.git && cd tinyvpn
 cargo build --release
 
 # 二进制文件位于 target/release/
@@ -42,8 +42,8 @@ chmod +x tinyvpn-ccs tinyvpn-relay tinyvpn-cli
 
 ```
                     ┌──────────────┐
-                    │   CCS 服务器  │ :9090/TCP
-                    │  (协调服务)   │
+                    │   CCS 服务器  │ :9090/QUIC
+                    │  (协调服务)   │ :38080/HTTP (管理面板)
                     └──────┬───────┘
                            │
               ┌────────────┼────────────┐
@@ -64,7 +64,7 @@ chmod +x tinyvpn-ccs tinyvpn-relay tinyvpn-cli
 
 ### 1. 启动 CCS（控制协调服务器）
 
-CCS 是核心组件，负责节点注册、密钥交换、拓扑管理。
+CCS 是核心组件，负责节点注册、密钥交换、ACL 策略、Web 管理。
 
 ```bash
 # 前台运行（测试用）
@@ -78,8 +78,9 @@ nohup ./tinyvpn-ccs > /var/log/tinyvpn-ccs.log 2>&1 &
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `CCS_ADDR` | `0.0.0.0:9090` | CCS 监听地址 |
+| `CCS_ADDR` | `0.0.0.0:9090` | CCS QUIC 监听地址 |
 | `RELAY_ADDR` | `127.0.0.1:9091` | Relay 服务器地址，告知客户端 |
+| `WEB_ADDR` | `0.0.0.0:38080` | Web 管理面板监听地址 |
 
 ### 2. 启动 Relay（中继服务器）
 
@@ -102,8 +103,9 @@ nohup ./tinyvpn-relay > /var/log/tinyvpn-relay.log 2>&1 &
 ### 3. 防火墙配置
 
 ```bash
-# CCS 服务器 — 开放 TCP 9090
-iptables -A INPUT -p tcp --dport 9090 -j ACCEPT
+# CCS 服务器 — 开放 QUIC 9090 + Web 38080
+iptables -A INPUT -p udp --dport 9090 -j ACCEPT
+iptables -A INPUT -p tcp --dport 38080 -j ACCEPT
 
 # Relay 服务器 — 开放 UDP 9091
 iptables -A INPUT -p udp --dport 9091 -j ACCEPT
@@ -111,6 +113,20 @@ iptables -A INPUT -p udp --dport 9091 -j ACCEPT
 # 所有节点 — 开放 WireGuard 端口（默认 51820/UDP）
 iptables -A INPUT -p udp --dport 51820 -j ACCEPT
 ```
+
+### 4. Web 管理面板
+
+CCS 启动后自动运行 Web 管理面板，浏览器访问：
+
+```
+http://<ccs-ip>:38080
+```
+
+功能：
+- 节点状态总览（在线/离线、VPN IP、公网端点）
+- ACL 组管理（添加/移除节点分组）
+- ACL 规则管理（配置组间访问策略）
+- 每 5 秒自动刷新
 
 ## 客户端使用
 
@@ -144,15 +160,6 @@ iptables -A INPUT -p udp --dport 51820 -j ACCEPT
 ./tinyvpn-cli --ccs <ccs-ip>:9090 status
 ```
 
-输出示例：
-```
-Node: node-a (node-2c998e69c324f566)
-   VPN IP: 10.13.0.1
-   Peers: 2 online
-   - node-b (10.13.0.2) → 47.251.143.2:52717 [online]
-   - node-c (10.13.0.3) → unknown [offline]
-```
-
 ### 断开连接
 
 ```bash
@@ -160,6 +167,42 @@ Node: node-a (node-2c998e69c324f566)
 # 如果用了自定义接口名：
 ./tinyvpn-cli --interface wg1 disconnect
 ```
+
+### TCP 端口转发
+
+将远程 VPN 节点的端口映射到本地：
+
+```bash
+# 转发 SSH（本地 2222 → 远程 10.13.0.1:22）
+./tinyvpn-cli forward --vpn-ip 10.13.0.1 --remote-port 22 --local-port 2222
+
+# 转发 Web（本地 8080 → 远程 10.13.0.1:80）
+./tinyvpn-cli forward --vpn-ip 10.13.0.1 --remote-port 80 --local-port 8080
+```
+
+### ACL 管理
+
+```bash
+# 列出所有组和规则
+./tinyvpn-cli acl --action list
+
+# 将节点加入组
+./tinyvpn-cli acl --action add-group --node-id <node-id> --group-name dev
+
+# 从组中移除节点
+./tinyvpn-cli acl --action remove-group --node-id <node-id> --group-name dev
+
+# 添加规则：admin 组可以访问 dev 组
+./tinyvpn-cli acl --action add-rule --from-group admin --to-group dev
+
+# 移除规则
+./tinyvpn-cli acl --action remove-rule --from-group admin --to-group dev
+```
+
+ACL 规则说明：
+- 没有任何规则时，所有节点互相可见（兼容模式）
+- 添加第一条规则后进入白名单模式：节点只能看到规则允许的组
+- 节点可以属于多个组，任一组有权限即可看到对方
 
 ## 完整部署示例
 
@@ -192,6 +235,11 @@ RELAY_ADDR=0.0.0.0:9091 ./tinyvpn-relay &
 ping 10.13.0.2
 ```
 
+**访问管理面板：**
+```
+http://1.2.3.4:38080
+```
+
 ## 日志与调试
 
 设置环境变量 `RUST_LOG` 控制日志级别：
@@ -220,3 +268,6 @@ A: STUN 无法发现公网地址（防火墙或 NAT 限制）。节点将依赖 
 
 **Q: ping 不通但接口已创建**
 A: 检查 peer 的 endpoint 是否正确设置。同一台机器测试时打洞会失败，但同一主机可以通过本地路由直达。
+
+**Q: 内网穿透场景如何部署？**
+A: 参见 [内网穿透教程](nat-traversal.md)。
