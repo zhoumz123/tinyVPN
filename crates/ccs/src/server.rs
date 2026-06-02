@@ -3,9 +3,19 @@ use tokio::sync::RwLock;
 use anyhow::Result;
 use tinyvpn_core::protocol::{ControlMessage, AclGroupEntry, AclRuleEntry};
 use crate::registry::{Registry, SharedRegistry};
+use crate::web;
 
-pub async fn run(addr: &str, relay_addr: String) -> Result<()> {
-    let registry: SharedRegistry = Arc::new(RwLock::new(Registry::new(relay_addr)?));
+pub async fn run(addr: &str, relay_addr: &str, web_addr: &str) -> Result<()> {
+    let registry: SharedRegistry = Arc::new(RwLock::new(Registry::new(relay_addr.to_string())?));
+
+    // Spawn web dashboard
+    let web_registry = registry.clone();
+    let web_addr = web_addr.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = web::run(&web_addr, web_registry).await {
+            tracing::warn!("Web server error: {}", e);
+        }
+    });
 
     let reap_registry = registry.clone();
     tokio::spawn(async move {
