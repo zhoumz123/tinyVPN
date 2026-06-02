@@ -1,25 +1,29 @@
 # TinyVPN
 
-A lightweight, open-source mesh VPN built in Rust, inspired by [Tailscale](https://tailscale.com), [ZeroTier](https://www.zerotier.com), and [CloudNet](https://cloudnet.world).
+A lightweight, open-source mesh VPN built in Rust, inspired by [Tailscale](https://tailscale.com) and [ZeroTier](https://www.zerotier.com).
 
 TinyVPN connects distributed devices into a secure virtual network using WireGuard tunnels. Devices communicate directly via peer-to-peer connections with automatic NAT traversal, falling back to a relay server when direct connections are not possible.
 
 ## Features
 
 - **Mesh Networking** — All nodes connect directly to each other, no centralized routing
+- **QUIC Transport** — Control plane uses QUIC with TLS, stream-per-request multiplexing
 - **NAT Traversal** — STUN-based UDP hole punching for peer-to-peer connectivity
 - **Relay Fallback** — Automatic traffic relay when hole punching fails
 - **WireGuard Encryption** — X25519 key exchange + ChaCha20-Poly1305 authenticated encryption
 - **Session Authentication** — Token-based auth between nodes and the control server
 - **Heartbeat & Health** — Automatic online/offline detection with 60s heartbeat timeout
-- **Simple Deployment** — One control server + one relay + CLI clients
+- **SQLite Persistence** — Node registry survives restarts, IP address recycling
+- **Group-based ACL** — Fine-grained access control with group policies
+- **TCP Port Forwarding** — Expose remote services through the VPN mesh
+- **Web Dashboard** — Browser-based management with real-time node status and ACL management
 
 ## Architecture
 
 ```
                     ┌──────────────┐
-                    │  CCS Server  │ :9090/TCP
-                    │  (Control)   │
+                    │  CCS Server  │ :9090/QUIC
+                    │  (Control)   │ :38080/HTTP (Dashboard)
                     └──────┬───────┘
                            │
               ┌────────────┼────────────┐
@@ -36,19 +40,20 @@ TinyVPN connects distributed devices into a secure virtual network using WireGua
 
 | Crate | Description |
 |-------|-------------|
-| `tinyvpn-ccs` | Control Coordination Server — node registration, key exchange, peer discovery, topology management |
+| `tinyvpn-ccs` | Control Coordination Server — SQLite-backed node registry, peer discovery, ACL, web dashboard |
 | `tinyvpn-relay` | Relay Server — UDP packet forwarding when direct P2P connection fails |
-| `tinyvpn-cli` | CLI Client — `register`, `connect`, `status`, `disconnect` commands |
-| `tinyvpn-core` | Shared Library — crypto (X25519, ChaCha20-Poly1305), protocol types, WireGuard interface management |
+| `tinyvpn-cli` | CLI Client — `register`, `connect`, `status`, `disconnect`, `forward`, `acl` commands |
+| `tinyvpn-core` | Shared Library — crypto, protocol types, QUIC TLS helpers, WireGuard interface management |
 | `tinyvpn-p2p` | P2P Engine — STUN public endpoint discovery, UDP hole punching |
 
 ### Connection Flow
 
-1. Node generates X25519 keypair and registers with CCS → receives VPN IP + session token
-2. Node connects to CCS via persistent TCP, discovers public endpoint via STUN
-3. Node fetches peer list, creates WireGuard interface
+1. Node generates X25519 keypair and registers with CCS over QUIC → receives VPN IP + session token
+2. Node establishes persistent QUIC connection to CCS, discovers public endpoint via STUN
+3. Node fetches peer list (ACL-filtered), creates WireGuard interface
 4. For each peer: attempts UDP hole punching → direct connection, or falls back to relay
 5. Heartbeat loop keeps node online (60s timeout → marked offline)
+6. Web dashboard shows real-time node status and ACL management at `:38080`
 
 ## Quick Start
 
@@ -99,6 +104,26 @@ RELAY_ADDR=0.0.0.0:9091 ./target/release/tinyvpn-relay &
 ping 10.13.0.2
 ```
 
+**4. TCP port forwarding:**
+
+```bash
+# Forward local port 8080 to Node B's port 80 via VPN
+./target/release/tinyvpn-cli forward --vpn-ip 10.13.0.2 --remote-port 80 --local-port 8080
+```
+
+**5. ACL management:**
+
+```bash
+# List ACL groups and rules
+./target/release/tinyvpn-cli acl --action list
+
+# Add node to group
+./target/release/tinyvpn-cli acl --action add-group --node-id <id> --group-name dev
+
+# Add ACL rule: admin group can see dev group
+./target/release/tinyvpn-cli acl --action add-rule --from-group admin --to-group dev
+```
+
 ### CLI Reference
 
 | Command | Description |
@@ -107,6 +132,8 @@ ping 10.13.0.2
 | `connect` | Connect to the mesh network |
 | `status` | Show peer list and connection status |
 | `disconnect` | Tear down WireGuard interface and go offline |
+| `forward` | TCP port forwarding to a remote VPN node |
+| `acl` | Manage ACL groups and rules |
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -114,28 +141,13 @@ ping 10.13.0.2
 | `--interface` | `wg-tinyvpn` | WireGuard interface name |
 | `--port` | `51820` | WireGuard UDP listen port |
 
-### Pre-built Release
-
-Download the latest release package:
-
-```bash
-tar xzf tinyvpn-0.1.0-linux-aarch64.tar.gz
-cd tinyvpn-0.1.0-linux-aarch64
-
-# One-click server start
-./scripts/start-ccs.sh
-
-# Client
-./bin/tinyvpn-cli --ccs <server-ip>:9090 register --name my-node
-./bin/tinyvpn-cli --ccs <server-ip>:9090 connect
-```
-
 ## Network Ports
 
 | Service | Protocol | Port | Purpose |
 |---------|----------|------|---------|
-| CCS | TCP | 9090 | Control plane communication |
+| CCS | QUIC | 9090 | Control plane communication |
 | Relay | UDP | 9091 | Traffic relay for failed P2P |
+| Web Dashboard | HTTP | 38080 | Management interface |
 | WireGuard | UDP | 51820 | VPN tunnel data (configurable) |
 
 VPN subnet: `10.13.0.0/16` (up to 65,534 nodes)
@@ -144,34 +156,41 @@ VPN subnet: `10.13.0.0/16` (up to 65,534 nodes)
 
 - **Language:** Rust
 - **Async Runtime:** Tokio
+- **Transport:** QUIC (quinn) with self-signed TLS (rustls + rcgen)
 - **VPN Tunnel:** WireGuard (Linux kernel module)
 - **NAT Traversal:** STUN (RFC 5389)
 - **Crypto:** X25519 (key exchange), ChaCha20-Poly1305 (encryption)
-- **Control Protocol:** TCP + newline-delimited JSON
-
-## Documentation
-
-- [Product User Guide](docs/user-guide.md) — Complete usage manual (Chinese)
-- [Deployment Guide](docs/deployment.md) — Server deployment instructions (Chinese)
+- **Persistence:** SQLite (rusqlite)
+- **Web:** axum + embedded HTML/JS dashboard
+- **CLI:** clap
 
 ## Project Status
 
-MVP complete. Implemented:
+Feature-complete:
 
 - [x] WireGuard tunnel between two nodes
 - [x] Control server with session authentication
 - [x] STUN-based NAT traversal and UDP hole punching
 - [x] Relay fallback for failed P2P connections
-- [x] CLI: register, connect, status, disconnect
+- [x] QUIC transport with TLS for control plane
+- [x] Stream-per-request QUIC multiplexing
+- [x] SQLite persistence with IP recycling
+- [x] Heartbeat and stale node reaper
+- [x] Group-based ACL policy engine
+- [x] TCP port forwarding
+- [x] Web management dashboard
+- [x] CLI: register, connect, status, disconnect, forward, acl
 
 Planned:
 
-- [ ] QUIC transport for control plane
-- [ ] TLS encryption for control protocol
-- [ ] TCP/UDP port forwarding (内网穿透)
-- [ ] ACL / zero-trust policy engine
-- [ ] Web management panel
+- [ ] NAT type detection (symmetric NAT handling)
+- [ ] WireGuard key rotation
 - [ ] Cross-platform clients (macOS, Windows, Android)
+
+## Documentation
+
+- [Product User Guide](docs/user-guide.md) — Complete usage manual (Chinese)
+- [Deployment Guide](docs/deployment.md) — Server deployment instructions (Chinese)
 
 ## License
 
