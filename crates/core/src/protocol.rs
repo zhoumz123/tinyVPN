@@ -60,6 +60,50 @@ pub enum ControlMessage {
         session_token: String,
     },
     Pong,
+
+    /// Node → CCS: Add a node to a group
+    AclAddGroup {
+        node_id: String,
+        session_token: String,
+        target_node_id: String,
+        group_name: String,
+    },
+
+    /// Node → CCS: Remove a node from a group
+    AclRemoveGroup {
+        node_id: String,
+        session_token: String,
+        target_node_id: String,
+        group_name: String,
+    },
+
+    /// Node → CCS: Add an ACL rule
+    AclAddRule {
+        node_id: String,
+        session_token: String,
+        from_group: String,
+        to_group: String,
+    },
+
+    /// Node → CCS: Remove an ACL rule
+    AclRemoveRule {
+        node_id: String,
+        session_token: String,
+        from_group: String,
+        to_group: String,
+    },
+
+    /// Node → CCS: List all ACL config
+    AclList {
+        node_id: String,
+        session_token: String,
+    },
+
+    /// CCS → Node: ACL config listing
+    AclListResponse {
+        groups: Vec<AclGroupEntry>,
+        rules: Vec<AclRuleEntry>,
+    },
 }
 
 /// Information about a peer in the network
@@ -71,6 +115,18 @@ pub struct PeerInfo {
     pub public_key: String,
     pub endpoint: String,
     pub connected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AclGroupEntry {
+    pub node_id: String,
+    pub group_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AclRuleEntry {
+    pub from_group: String,
+    pub to_group: String,
 }
 
 #[cfg(test)]
@@ -158,5 +214,42 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"name\""));
         assert!(json.contains("\"public_key\""));
+    }
+
+    #[test]
+    fn acl_messages_roundtrip() {
+        use super::{AclGroupEntry, AclRuleEntry};
+        roundtrip(ControlMessage::AclAddGroup {
+            node_id: "n1".into(),
+            session_token: "tok".into(),
+            target_node_id: "n2".into(),
+            group_name: "admin".into(),
+        });
+        roundtrip(ControlMessage::AclRemoveGroup {
+            node_id: "n1".into(),
+            session_token: "tok".into(),
+            target_node_id: "n2".into(),
+            group_name: "admin".into(),
+        });
+        roundtrip(ControlMessage::AclAddRule {
+            node_id: "n1".into(),
+            session_token: "tok".into(),
+            from_group: "admin".into(),
+            to_group: "dev".into(),
+        });
+        roundtrip(ControlMessage::AclRemoveRule {
+            node_id: "n1".into(),
+            session_token: "tok".into(),
+            from_group: "admin".into(),
+            to_group: "dev".into(),
+        });
+        roundtrip(ControlMessage::AclList {
+            node_id: "n1".into(),
+            session_token: "tok".into(),
+        });
+        roundtrip(ControlMessage::AclListResponse {
+            groups: vec![AclGroupEntry { node_id: "n1".into(), group_name: "admin".into() }],
+            rules: vec![AclRuleEntry { from_group: "admin".into(), to_group: "dev".into() }],
+        });
     }
 }

@@ -50,6 +50,46 @@ enum Commands {
         #[arg(short, long)]
         target: Option<String>,
     },
+
+    /// Manage ACL policies
+    Acl {
+        #[command(subcommand)]
+        action: AclAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AclAction {
+    /// Add a node to a group
+    AddGroup {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        group: String,
+    },
+    /// Remove a node from a group
+    RemoveGroup {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        group: String,
+    },
+    /// Add an ACL rule
+    AddRule {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
+    /// Remove an ACL rule
+    RemoveRule {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
+    /// List all ACL groups and rules
+    List,
 }
 
 #[tokio::main]
@@ -69,6 +109,7 @@ async fn main() -> Result<()> {
         Commands::Status => status(&cli.ccs).await,
         Commands::Disconnect => disconnect(&cli.interface).await,
         Commands::Forward { port, target } => forward(port, target).await,
+        Commands::Acl { action } => acl(&cli.ccs, action).await,
     }
 }
 
@@ -294,6 +335,91 @@ async fn proxy_connection(client: tokio::net::TcpStream, target: &str) -> Result
         r = tokio::io::copy(&mut sr, &mut cw) => r?,
     };
 
+    Ok(())
+}
+
+async fn acl(ccs_addr: &str, action: AclAction) -> Result<()> {
+    let config = NodeConfig::load().map_err(|_| {
+        anyhow::anyhow!("Not registered yet. Run: tinyvpn register --name <name>")
+    })?;
+
+    match action {
+        AclAction::AddGroup { node, group } => {
+            let resp = rpc(ccs_addr, &ControlMessage::AclAddGroup {
+                node_id: config.node_id,
+                session_token: config.session_token,
+                target_node_id: node,
+                group_name: group,
+            }).await?;
+            match resp {
+                ControlMessage::Pong => println!("Group added."),
+                other => println!("Error: {:?}", other),
+            }
+        }
+        AclAction::RemoveGroup { node, group } => {
+            let resp = rpc(ccs_addr, &ControlMessage::AclRemoveGroup {
+                node_id: config.node_id,
+                session_token: config.session_token,
+                target_node_id: node,
+                group_name: group,
+            }).await?;
+            match resp {
+                ControlMessage::Pong => println!("Group removed."),
+                other => println!("Error: {:?}", other),
+            }
+        }
+        AclAction::AddRule { from, to } => {
+            let resp = rpc(ccs_addr, &ControlMessage::AclAddRule {
+                node_id: config.node_id,
+                session_token: config.session_token,
+                from_group: from,
+                to_group: to,
+            }).await?;
+            match resp {
+                ControlMessage::Pong => println!("Rule added."),
+                other => println!("Error: {:?}", other),
+            }
+        }
+        AclAction::RemoveRule { from, to } => {
+            let resp = rpc(ccs_addr, &ControlMessage::AclRemoveRule {
+                node_id: config.node_id,
+                session_token: config.session_token,
+                from_group: from,
+                to_group: to,
+            }).await?;
+            match resp {
+                ControlMessage::Pong => println!("Rule removed."),
+                other => println!("Error: {:?}", other),
+            }
+        }
+        AclAction::List => {
+            let resp = rpc(ccs_addr, &ControlMessage::AclList {
+                node_id: config.node_id,
+                session_token: config.session_token,
+            }).await?;
+            match resp {
+                ControlMessage::AclListResponse { groups, rules } => {
+                    if groups.is_empty() {
+                        println!("No groups defined.");
+                    } else {
+                        println!("Groups:");
+                        for g in &groups {
+                            println!("   {} -> {}", g.node_id, g.group_name);
+                        }
+                    }
+                    if rules.is_empty() {
+                        println!("No rules defined (all traffic denied by default).");
+                    } else {
+                        println!("Rules:");
+                        for r in &rules {
+                            println!("   {} -> {} (allow)", r.from_group, r.to_group);
+                        }
+                    }
+                }
+                other => println!("Error: {:?}", other),
+            }
+        }
+    }
     Ok(())
 }
 

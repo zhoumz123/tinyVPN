@@ -38,6 +38,16 @@ impl Registry {
                 session_token TEXT NOT NULL,
                 connected INTEGER NOT NULL DEFAULT 1,
                 last_heartbeat INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS acl_groups (
+                node_id TEXT NOT NULL,
+                group_name TEXT NOT NULL,
+                PRIMARY KEY (node_id, group_name)
+            );
+            CREATE TABLE IF NOT EXISTS acl_rules (
+                from_group TEXT NOT NULL,
+                to_group TEXT NOT NULL,
+                PRIMARY KEY (from_group, to_group)
             );"
         )?;
 
@@ -180,13 +190,133 @@ impl Registry {
         }
     }
 
-    /// Get all peers (excluding the requesting node)
+    /// Get all peers visible to the requesting node (ACL-filtered)
     pub fn get_peers(&self, exclude_id: Option<&str>) -> Vec<PeerInfo> {
-        self.nodes
-            .values()
-            .filter(|e| exclude_id.is_none_or(|id| e.info.node_id != id))
+        let exclude = exclude_id.unwrap_or("");
+
+        if !self.has_rules() {
+            return self.nodes.values()
+                .filter(|e| e.info.node_id != exclude)
+                .map(|e| e.info.clone())
+                .collect();
+        }
+
+        let my_groups = self.node_groups(exclude);
+        if my_groups.is_empty() {
+            return Vec::new();
+        }
+
+        let visible = self.visible_groups(&my_groups);
+        if visible.is_empty() {
+            return Vec::new();
+        }
+
+        self.nodes.values()
+            .filter(|e| {
+                if e.info.node_id == exclude {
+                    return false;
+                }
+                let peer_groups = self.node_groups(&e.info.node_id);
+                peer_groups.iter().any(|g| visible.contains(g))
+            })
             .map(|e| e.info.clone())
             .collect()
+    }
+
+    pub fn add_group(&self, node_id: &str, group: &str) -> anyhow::Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO acl_groups (node_id, group_name) VALUES (?1, ?2)",
+            params![node_id, group],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_group(&self, node_id: &str, group: &str) -> anyhow::Result<()> {
+        self.db.lock().unwrap().execute(
+            "DELETE FROM acl_groups WHERE node_id = ?1 AND group_name = ?2",
+            params![node_id, group],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_rule(&self, from_group: &str, to_group: &str) -> anyhow::Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO acl_rules (from_group, to_group) VALUES (?1, ?2)",
+            params![from_group, to_group],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_rule(&self, from_group: &str, to_group: &str) -> anyhow::Result<()> {
+        self.db.lock().unwrap().execute(
+            "DELETE FROM acl_rules WHERE from_group = ?1 AND to_group = ?2",
+            params![from_group, to_group],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_groups(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT node_id, group_name FROM acl_groups ORDER BY node_id, group_name")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn list_rules(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT from_group, to_group FROM acl_rules ORDER BY from_group, to_group")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    fn node_groups(&self, node_id: &str) -> Vec<String> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = match db.prepare("SELECT group_name FROM acl_groups WHERE node_id = ?1") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![node_id], |row| row.get(0));
+        match rows {
+            Ok(r) => r.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn visible_groups(&self, from_groups: &[String]) -> Vec<String> {
+        if from_groups.is_empty() {
+            return Vec::new();
+        }
+        let db = self.db.lock().unwrap();
+        let mut result = Vec::new();
+        for fg in from_groups {
+            let mut stmt = match db.prepare("SELECT to_group FROM acl_rules WHERE from_group = ?1") {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let rows = stmt.query_map(params![fg], |row| row.get(0));
+            if let Ok(r) = rows {
+                for g in r.flatten() {
+                    if !result.contains(&g) {
+                        result.push(g);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    pub fn has_rules(&self) -> bool {
+        let db = self.db.lock().unwrap();
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM acl_rules", [], |row| row.get(0)).unwrap_or(0);
+        count > 0
     }
 
     /// Get a specific peer's info
@@ -254,6 +384,16 @@ mod tests {
                 session_token TEXT NOT NULL,
                 connected INTEGER NOT NULL DEFAULT 1,
                 last_heartbeat INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS acl_groups (
+                node_id TEXT NOT NULL,
+                group_name TEXT NOT NULL,
+                PRIMARY KEY (node_id, group_name)
+            );
+            CREATE TABLE IF NOT EXISTS acl_rules (
+                from_group TEXT NOT NULL,
+                to_group TEXT NOT NULL,
+                PRIMARY KEY (from_group, to_group)
             );"
         )?;
         Ok(Registry {
@@ -373,6 +513,16 @@ mod tests {
                 session_token TEXT NOT NULL,
                 connected INTEGER NOT NULL DEFAULT 1,
                 last_heartbeat INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS acl_groups (
+                node_id TEXT NOT NULL,
+                group_name TEXT NOT NULL,
+                PRIMARY KEY (node_id, group_name)
+            );
+            CREATE TABLE IF NOT EXISTS acl_rules (
+                from_group TEXT NOT NULL,
+                to_group TEXT NOT NULL,
+                PRIMARY KEY (from_group, to_group)
             );"
         ).unwrap();
 
@@ -390,5 +540,63 @@ mod tests {
         ).unwrap();
         assert_eq!(count, 1);
         assert!(reg1.validate_session(&id, &tok));
+    }
+
+    #[test]
+    fn acl_no_rules_allows_all() {
+        let mut reg = new_registry().unwrap();
+        let (id1, _, _) = reg.register("a".into(), "pk1".into()).unwrap();
+        let (_, _, _) = reg.register("b".into(), "pk2".into()).unwrap();
+        let peers = reg.get_peers(Some(&id1));
+        assert_eq!(peers.len(), 1);
+    }
+
+    #[test]
+    fn acl_deny_by_default() {
+        let mut reg = new_registry().unwrap();
+        let (id1, _, _) = reg.register("a".into(), "pk1".into()).unwrap();
+        let (_, _, _) = reg.register("b".into(), "pk2".into()).unwrap();
+        reg.add_rule("admin", "dev").unwrap();
+        let peers = reg.get_peers(Some(&id1));
+        assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn acl_group_visibility() {
+        let mut reg = new_registry().unwrap();
+        let (id1, _, _) = reg.register("a".into(), "pk1".into()).unwrap();
+        let (id2, _, _) = reg.register("b".into(), "pk2".into()).unwrap();
+        let (id3, _, _) = reg.register("c".into(), "pk3".into()).unwrap();
+
+        reg.add_group(&id1, "admin").unwrap();
+        reg.add_group(&id2, "dev").unwrap();
+        reg.add_group(&id3, "db").unwrap();
+
+        reg.add_rule("admin", "dev").unwrap();
+
+        let peers = reg.get_peers(Some(&id1));
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_id, id2);
+
+        let peers = reg.get_peers(Some(&id2));
+        assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn acl_multi_group() {
+        let mut reg = new_registry().unwrap();
+        let (id1, _, _) = reg.register("a".into(), "pk1".into()).unwrap();
+        let (id2, _, _) = reg.register("b".into(), "pk2".into()).unwrap();
+        let (id3, _, _) = reg.register("c".into(), "pk3".into()).unwrap();
+
+        reg.add_group(&id1, "admin").unwrap();
+        reg.add_group(&id2, "dev").unwrap();
+        reg.add_group(&id3, "db").unwrap();
+
+        reg.add_rule("admin", "dev").unwrap();
+        reg.add_rule("admin", "db").unwrap();
+
+        let peers = reg.get_peers(Some(&id1));
+        assert_eq!(peers.len(), 2);
     }
 }

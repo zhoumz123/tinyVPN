@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use anyhow::Result;
-use tinyvpn_core::protocol::ControlMessage;
+use tinyvpn_core::protocol::{ControlMessage, AclGroupEntry, AclRuleEntry};
 use crate::registry::{Registry, SharedRegistry};
 
 pub async fn run(addr: &str, relay_addr: String) -> Result<()> {
@@ -128,6 +128,71 @@ async fn handle_stream(
                 reg.heartbeat(&node_id);
             }
             serde_json::to_string(&ControlMessage::Pong)?
+        }
+
+        ControlMessage::AclAddGroup { node_id, session_token, target_node_id, group_name } => {
+            let reg = registry.read().await;
+            if reg.validate_session(&node_id, &session_token) {
+                drop(reg);
+                let reg = registry.write().await;
+                if let Err(e) = reg.add_group(&target_node_id, &group_name) {
+                    tracing::warn!("ACL add group error: {}", e);
+                }
+            }
+            serde_json::to_string(&ControlMessage::Pong)?
+        }
+
+        ControlMessage::AclRemoveGroup { node_id, session_token, target_node_id, group_name } => {
+            let reg = registry.read().await;
+            if reg.validate_session(&node_id, &session_token) {
+                drop(reg);
+                let reg = registry.write().await;
+                if let Err(e) = reg.remove_group(&target_node_id, &group_name) {
+                    tracing::warn!("ACL remove group error: {}", e);
+                }
+            }
+            serde_json::to_string(&ControlMessage::Pong)?
+        }
+
+        ControlMessage::AclAddRule { node_id, session_token, from_group, to_group } => {
+            let reg = registry.read().await;
+            if reg.validate_session(&node_id, &session_token) {
+                drop(reg);
+                let reg = registry.write().await;
+                if let Err(e) = reg.add_rule(&from_group, &to_group) {
+                    tracing::warn!("ACL add rule error: {}", e);
+                }
+            }
+            serde_json::to_string(&ControlMessage::Pong)?
+        }
+
+        ControlMessage::AclRemoveRule { node_id, session_token, from_group, to_group } => {
+            let reg = registry.read().await;
+            if reg.validate_session(&node_id, &session_token) {
+                drop(reg);
+                let reg = registry.write().await;
+                if let Err(e) = reg.remove_rule(&from_group, &to_group) {
+                    tracing::warn!("ACL remove rule error: {}", e);
+                }
+            }
+            serde_json::to_string(&ControlMessage::Pong)?
+        }
+
+        ControlMessage::AclList { node_id, session_token } => {
+            let reg = registry.read().await;
+            if reg.validate_session(&node_id, &session_token) {
+                let groups = reg.list_groups().unwrap_or_default()
+                    .into_iter()
+                    .map(|(n, g)| AclGroupEntry { node_id: n, group_name: g })
+                    .collect();
+                let rules = reg.list_rules().unwrap_or_default()
+                    .into_iter()
+                    .map(|(f, t)| AclRuleEntry { from_group: f, to_group: t })
+                    .collect();
+                serde_json::to_string(&ControlMessage::AclListResponse { groups, rules })?
+            } else {
+                serde_json::to_string(&ControlMessage::Pong)?
+            }
         }
 
         _ => {
