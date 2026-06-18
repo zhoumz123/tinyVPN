@@ -7,12 +7,6 @@ pub const NETWORK_CIDR: &str = "10.13.0.0/16";
 /// Control server default bind address
 pub const CCS_DEFAULT_ADDR: &str = "0.0.0.0:9090";
 
-/// STUN server used for NAT detection
-pub const STUN_SERVERS: &[&str] = &[
-    "stun:stun.l.google.com:19302",
-    "stun:stun1.l.google.com:19302",
-];
-
 /// Persistent node configuration stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {

@@ -14,4 +14,3 @@ serde_json = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 tinyvpn-core = { workspace = true }
-tinyvpn-p2p = { workspace = true }

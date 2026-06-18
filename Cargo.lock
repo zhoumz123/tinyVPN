@@ -1508,7 +1508,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tinyvpn-core",
- "tinyvpn-p2p",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1530,19 +1529,6 @@ dependencies = [
  "tokio",
  "tracing",
  "x25519-dalek",
-]
-
-[[package]]
-name = "tinyvpn-p2p"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "tinyvpn-core",
- "tokio",
- "tracing",
 ]
 
 [[package]]

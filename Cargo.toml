@@ -2,7 +2,6 @@
 members = [
     "crates/core",
     "crates/ccs",
-    "crates/p2p",
     "crates/relay",
     "crates/cli",
 ]
@@ -52,4 +51,3 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Internal crates
 tinyvpn-core = { path = "crates/core" }
-tinyvpn-p2p = { path = "crates/p2p" }
