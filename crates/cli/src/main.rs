@@ -162,21 +162,6 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
     let endpoint = tinyvpn_core::tls::create_client()?;
     let conn = Arc::new(endpoint.connect(ccs_addr.parse()?, "localhost")?.await?);
 
-    println!("Discovering public endpoint via STUN...");
-    match tinyvpn_p2p::discover_public_endpoint().await {
-        Ok(stun_endpoint) => {
-            println!("   Public endpoint: {}", stun_endpoint);
-            conn_rpc(&conn, &ControlMessage::UpdateEndpoint {
-                node_id: config.node_id.clone(),
-                session_token: config.session_token.clone(),
-                public_addr: stun_endpoint.to_string(),
-            }).await?;
-        }
-        Err(e) => {
-            println!("   STUN failed: {} (will rely on relay)", e);
-        }
-    }
-
     println!("Fetching peer list...");
     let response = conn_rpc(&conn, &ControlMessage::GetPeers {
         node_id: config.node_id.clone(),
@@ -203,47 +188,29 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
     wg.setup(&config.vpn_ip, &config.private_key, wg_port)?;
 
     for peer in &peers {
-        if peer.endpoint.is_empty() {
-            println!("   Skipping {} (no public endpoint yet)", peer.name);
-            continue;
-        }
-
-        println!("   Punching to {}...", peer.name);
-        let puncher = tinyvpn_p2p::Puncher::new().await?;
-        let endpoint: std::net::SocketAddr = peer.endpoint.parse()?;
-
-        let peer_endpoint = match puncher.punch(endpoint, &config.node_id).await {
-            Ok(()) => {
-                println!("   Connected to {} (direct)", peer.name);
-                peer.endpoint.clone()
-            }
-            Err(_) => {
-                println!("   Punch failed, requesting relay for {}...", peer.name);
-                let resp = conn_rpc(&conn, &ControlMessage::RequestRelay {
-                    node_id: config.node_id.clone(),
-                    session_token: config.session_token.clone(),
-                    target_id: peer.node_id.clone(),
-                }).await?;
-                match resp {
-                    ControlMessage::RelayAssigned { relay_addr, target_id } => {
-                        println!("   Using relay {} for {}", relay_addr, peer.name);
-                        if let Some(tid) = target_id {
-                            if let Err(e) = register_with_relay(&relay_addr, &config.node_id, &tid).await {
-                                println!("   Warning: relay registration failed: {}", e);
-                            }
-                        }
-                        relay_addr
-                    }
-                    _ => {
-                        println!("   Failed to get relay for {}, skipping", peer.name);
-                        continue;
+        println!("   Requesting relay for {}...", peer.name);
+        let resp = conn_rpc(&conn, &ControlMessage::RequestRelay {
+            node_id: config.node_id.clone(),
+            session_token: config.session_token.clone(),
+            target_id: peer.node_id.clone(),
+        }).await?;
+        let relay_addr = match resp {
+            ControlMessage::RelayAssigned { relay_addr, target_id } => {
+                if let Some(tid) = target_id {
+                    if let Err(e) = register_with_relay(&relay_addr, &config.node_id, &tid).await {
+                        println!("   Warning: relay registration failed for {}: {}", peer.name, e);
                     }
                 }
+                relay_addr
+            }
+            _ => {
+                println!("   Failed to get relay for {}, skipping", peer.name);
+                continue;
             }
         };
-
+        println!("   Using relay {} for {}", relay_addr, peer.name);
         let allowed_ip = format!("{}/32", peer.vpn_ip);
-        if let Err(e) = wg.add_peer(&peer.public_key, &allowed_ip, Some(&peer_endpoint)) {
+        if let Err(e) = wg.add_peer(&peer.public_key, &allowed_ip, Some(&relay_addr)) {
             println!("   Failed to add WG peer {}: {}", peer.name, e);
         }
     }
