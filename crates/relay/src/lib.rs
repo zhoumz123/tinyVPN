@@ -8,7 +8,7 @@
 //! WireGuard data flows from the kernel WG listen port — different ports on
 //! the same IP, so matching by full source address would never succeed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,9 +19,10 @@ use anyhow::Result;
 const NODE_TIMEOUT_SECS: u64 = 120;
 const BUF_SIZE: usize = 65535;
 
-/// A registered node: the peer it wants to reach and its learned WG endpoint.
+/// A registered node: the peers it wants to reach and its learned WG endpoint.
 struct NodeEntry {
-    peer_id: String,
+    /// All peers this node registered to relay to.
+    peer_ids: HashSet<String>,
     /// Real WireGuard endpoint learned from observed packets (port roaming).
     wg_addr: Option<SocketAddr>,
     last_activity: Instant,
@@ -97,12 +98,12 @@ impl Relay {
         {
             let mut nodes = self.nodes.lock().await;
             let entry = nodes.entry(my_id.clone()).or_insert(NodeEntry {
-                peer_id: peer_id.clone(),
+                peer_ids: HashSet::new(),
                 // Seed with the registration source; real WG traffic roam-updates it.
                 wg_addr: Some(from),
                 last_activity: Instant::now(),
             });
-            entry.peer_id = peer_id.clone();
+            entry.peer_ids.insert(peer_id.clone());
             entry.wg_addr = Some(from);
             entry.last_activity = Instant::now();
         }
@@ -112,6 +113,11 @@ impl Relay {
     }
 
     /// Forward a data packet, learning the source's real WG endpoint.
+    ///
+    /// Fan-out: forward to ALL peers this node registered for. WireGuard
+    /// packets are sealed for a specific recipient public key, so only the
+    /// intended peer accepts each packet — the rest drop it. This lets a node
+    /// reach multiple relayed peers through one source socket.
     async fn forward(&self, data: &[u8], from: SocketAddr) {
         let node_id = {
             let ip_index = self.ip_index.lock().await;
@@ -122,32 +128,32 @@ impl Relay {
             return;
         };
 
-        let peer_addr = {
+        let peer_addrs = {
             let mut nodes = self.nodes.lock().await;
             if let Some(entry) = nodes.get_mut(&node_id) {
                 // Port learning / roaming: record the real WG source address.
                 entry.wg_addr = Some(from);
                 entry.last_activity = Instant::now();
             }
-            let peer_id = nodes.get(&node_id).map(|e| e.peer_id.clone());
-            match peer_id {
-                Some(pid) => nodes.get(&pid).and_then(|p| p.wg_addr),
-                None => None,
-            }
+            let Some(entry) = nodes.get(&node_id) else { return };
+            entry
+                .peer_ids
+                .iter()
+                .filter_map(|pid| nodes.get(pid).and_then(|p| p.wg_addr))
+                .collect::<Vec<_>>()
         };
 
-        match peer_addr {
-            Some(addr) => {
-                if let Err(e) = self.socket.send_to(data, addr).await {
-                    tracing::warn!("Relay send_to {} failed: {}", addr, e);
-                } else {
-                    tracing::trace!("Relayed {} bytes {} -> {}", data.len(), from, addr);
-                }
-            }
-            None => {
-                // Peer hasn't sent yet; we've learned our endpoint, will work
-                // once the peer's first packet arrives.
-                tracing::debug!("No peer endpoint yet for packet from {}", from);
+        if peer_addrs.is_empty() {
+            // No peer has sent yet; we've learned our endpoint, will work once
+            // a peer's first packet arrives.
+            tracing::debug!("No peer endpoint yet for packet from {}", from);
+            return;
+        }
+        for addr in peer_addrs {
+            if let Err(e) = self.socket.send_to(data, addr).await {
+                tracing::warn!("Relay send_to {} failed: {}", addr, e);
+            } else {
+                tracing::trace!("Relayed {} bytes {} -> {}", data.len(), from, addr);
             }
         }
     }
@@ -229,6 +235,54 @@ mod tests {
             wg_b.recv_from(&mut buf),
         ).await.expect("B's real WG port was never learned (port roaming broken)").unwrap();
         assert_eq!(&buf[..n], b"data-a");
+
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_fanout_to_multiple_peers() {
+        // A node relayed to multiple peers must reach ALL of them. The relay
+        // fan-outs to every registered peer; WireGuard's per-key encryption means
+        // only the intended recipient accepts each packet.
+        let relay = Relay::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.socket.local_addr().unwrap();
+
+        let h = tokio::spawn(async move {
+            let _ = relay.run().await;
+        });
+
+        let reg_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reg_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let reg_c = UdpSocket::bind("127.0.0.3:0").await.unwrap();
+        let mut buf = [0u8; 64];
+
+        // A registers for BOTH B and C; B and C each register for A.
+        reg_a.send_to(b"REGISTER:node-a:node-b", relay_addr).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), reg_a.recv_from(&mut buf)).await.unwrap();
+        reg_a.send_to(b"REGISTER:node-a:node-c", relay_addr).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), reg_a.recv_from(&mut buf)).await.unwrap();
+        reg_b.send_to(b"REGISTER:node-b:node-a", relay_addr).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), reg_b.recv_from(&mut buf)).await.unwrap();
+        reg_c.send_to(b"REGISTER:node-c:node-a", relay_addr).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), reg_c.recv_from(&mut buf)).await.unwrap();
+
+        // B and C send first so the relay learns their real WG ports.
+        let wg_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let wg_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let wg_c = UdpSocket::bind("127.0.0.3:0").await.unwrap();
+        wg_b.send_to(b"learn-b", relay_addr).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), reg_a.recv_from(&mut buf)).await;
+        wg_c.send_to(b"learn-c", relay_addr).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), reg_a.recv_from(&mut buf)).await;
+
+        // A sends one packet; BOTH B and C must receive it (fan-out).
+        wg_a.send_to(b"broadcast", relay_addr).await.unwrap();
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(2), wg_b.recv_from(&mut buf))
+            .await.expect("B never received (fan-out broken)").unwrap();
+        assert_eq!(&buf[..n], b"broadcast");
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(2), wg_c.recv_from(&mut buf))
+            .await.expect("C never received (fan-out broken)").unwrap();
+        assert_eq!(&buf[..n], b"broadcast");
 
         h.abort();
     }
