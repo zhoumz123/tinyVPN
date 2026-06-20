@@ -90,6 +90,8 @@ impl Relay {
                 continue;
             }
 
+            // Debug log for non-register packets
+            tracing::debug!("Received {} bytes from {}", n, from);
             self.forward(&buf[..n], from).await;
         }
     }
@@ -99,12 +101,24 @@ impl Relay {
             let mut nodes = self.nodes.lock().await;
             let entry = nodes.entry(my_id.clone()).or_insert(NodeEntry {
                 peer_ids: HashSet::new(),
-                // Seed with the registration source; real WG traffic roam-updates it.
-                wg_addr: Some(from),
+                wg_addr: None,
                 last_activity: Instant::now(),
             });
             entry.peer_ids.insert(peer_id.clone());
-            entry.wg_addr = Some(from);
+            // Prefer 127.0.0.1 for local Relay scenarios; don't overwrite with external IP.
+            // This handles the case where client registers from both localhost and external IP.
+            let should_update = match entry.wg_addr {
+                None => true,
+                Some(current) => {
+                    // Update if new address is localhost and current is not
+                    (from.ip().is_loopback() && !current.ip().is_loopback()) ||
+                    // Or if they're from the same IP but newer (port roaming)
+                    (from.ip() == current.ip())
+                }
+            };
+            if should_update {
+                entry.wg_addr = Some(from);
+            }
             entry.last_activity = Instant::now();
         }
         // Attribute future packets from this IP to this node.
@@ -119,19 +133,59 @@ impl Relay {
     /// intended peer accepts each packet — the rest drop it. This lets a node
     /// reach multiple relayed peers through one source socket.
     async fn forward(&self, data: &[u8], from: SocketAddr) {
+        // Always search by wg_addr to handle port roaming and multiple nodes on same IP.
+        // ip_index is only used as a hint; we verify wg_addr matches to avoid collisions.
         let node_id = {
-            let ip_index = self.ip_index.lock().await;
-            ip_index.get(&from.ip()).cloned()
+            let nodes = self.nodes.lock().await;
+            tracing::debug!("Searching for node for packet from {}, {} nodes registered", from, nodes.len());
+            let mut found = None;
+
+            // First, try to match by exact SocketAddr (IP + port)
+            for (id, entry) in nodes.iter() {
+                if let Some(wg_addr) = entry.wg_addr {
+                    tracing::trace!("Checking node {}: wg_addr={}", id, wg_addr);
+                    if wg_addr == from {
+                        found = Some(id.clone());
+                        break;
+                    }
+                }
+            }
+
+            // If no exact match, try to match by IP only (for same-machine Relay
+            // where packets come from 127.0.0.1 but registered address may differ)
+            if found.is_none() {
+                for (id, entry) in nodes.iter() {
+                    if let Some(wg_addr) = entry.wg_addr {
+                        tracing::debug!("IP match check: node{} wg_addr.ip={} vs from.ip={}", id, wg_addr.ip(), from.ip());
+                        if wg_addr.ip() == from.ip() {
+                            tracing::info!("IP-only match: {} from node {} (wg_addr={})", from.ip(), id, wg_addr);
+                            found = Some(id.clone());
+                            // Prefer exact match, but accept IP match if no exact match exists
+                            break;
+                        }
+                    }
+                }
+            }
+
+            found
         };
-        let Some(node_id) = node_id else {
-            tracing::warn!("Packet from unknown IP: {}", from.ip());
-            return;
+
+        let node_id = match node_id {
+            Some(id) => id,
+            None => {
+                tracing::warn!("Packet from unknown source: {} (no matching node wg_addr)", from);
+                return;
+            }
         };
 
         let peer_addrs = {
             let mut nodes = self.nodes.lock().await;
             if let Some(entry) = nodes.get_mut(&node_id) {
                 // Port learning / roaming: record the real WG source address.
+                let old_addr = entry.wg_addr;
+                if old_addr != Some(from) {
+                    tracing::info!("Learned new endpoint for {}: {:?} -> {:?}", node_id, old_addr, from);
+                }
                 entry.wg_addr = Some(from);
                 entry.last_activity = Instant::now();
             }

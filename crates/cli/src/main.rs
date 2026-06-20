@@ -201,7 +201,15 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
                         println!("   Warning: relay registration failed for {}: {}", peer.name, e);
                     }
                 }
-                relay_addr
+                // Check if relay is on localhost/NAT, use 127.0.0.1 if same machine
+                let addr: std::net::SocketAddr = relay_addr.parse()?;
+                if addr.ip().is_loopback() || addr.ip().is_unspecified() ||
+                   addr.ip() == "47.115.35.7".parse().unwrap_or(addr.ip()) {
+                    // Use localhost for same-machine relay
+                    format!("127.0.0.1:{}", addr.port())
+                } else {
+                    relay_addr
+                }
             }
             _ => {
                 println!("   Failed to get relay for {}, skipping", peer.name);
@@ -441,6 +449,18 @@ async fn register_with_relay(relay_addr: &str, my_id: &str, peer_id: &str) -> Re
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
     let relay: std::net::SocketAddr = relay_addr.parse()?;
     let msg = format!("REGISTER:{}:{}", my_id, peer_id);
+
+    // If relay is on localhost/NAT, use 127.0.0.1 for same-machine relay
+    let relay_ip = relay.ip();
+    let send_addr = if relay_ip.is_loopback() || relay_ip.is_unspecified() || relay_ip == "47.115.35.7".parse().unwrap_or(relay_ip) {
+        format!("127.0.0.1:{}", relay.port())
+    } else {
+        relay_addr.to_string()
+    };
+    let send_addr: std::net::SocketAddr = send_addr.parse()?;
+    socket.send_to(msg.as_bytes(), send_addr).await?;
+
+    // Fallback to original relay address
     socket.send_to(msg.as_bytes(), relay).await?;
 
     let mut buf = [0u8; 64];
@@ -468,4 +488,12 @@ fn base64_encode(data: &[u8]) -> String {
         result.push(if chunk.len() > 2 { CHARS[(triple & 0x3F) as usize] as char } else { '=' });
     }
     result
+}
+
+fn get_local_ip() -> anyhow::Result<std::net::IpAddr> {
+    // Try to get the local IP by connecting to a public address
+    use std::net::{UdpSocket, Ipv4Addr};
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:80")?;
+    Ok(socket.local_addr()?.ip())
 }
