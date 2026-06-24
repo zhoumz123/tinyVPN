@@ -106,6 +106,11 @@ impl WgInterface {
         if let Some(ep) = endpoint {
             cmd.args(["endpoint", ep]);
         }
+        // Persistent keepalive is required for relay-only mode: the relay
+        // learns each peer's real WG endpoint from incoming traffic, so peers
+        // behind NAT must send periodically to keep both the NAT mapping and
+        // the relay's endpoint map fresh. 25s is below typical NAT timeouts.
+        cmd.args(["persistent-keepalive", "25"]);
         let status = cmd.status().with_context(|| "running wg set")?;
         if !status.success() {
             bail!("wg set failed for peer {}", public_key);

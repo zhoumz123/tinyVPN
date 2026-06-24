@@ -201,11 +201,8 @@ async fn connect(ccs_addr: &str, wg_interface: &str, wg_port: u16) -> Result<()>
                         println!("   Warning: relay registration failed for {}: {}", peer.name, e);
                     }
                 }
-                // Check if relay is on localhost/NAT, use 127.0.0.1 if same machine
                 let addr: std::net::SocketAddr = relay_addr.parse()?;
-                if addr.ip().is_loopback() || addr.ip().is_unspecified() ||
-                   addr.ip() == "47.115.35.7".parse().unwrap_or(addr.ip()) {
-                    // Use localhost for same-machine relay
+                if addr.ip().is_loopback() || addr.ip().is_unspecified() {
                     format!("127.0.0.1:{}", addr.port())
                 } else {
                     relay_addr
@@ -450,9 +447,8 @@ async fn register_with_relay(relay_addr: &str, my_id: &str, peer_id: &str) -> Re
     let relay: std::net::SocketAddr = relay_addr.parse()?;
     let msg = format!("REGISTER:{}:{}", my_id, peer_id);
 
-    // If relay is on localhost/NAT, use 127.0.0.1 for same-machine relay
     let relay_ip = relay.ip();
-    let send_addr = if relay_ip.is_loopback() || relay_ip.is_unspecified() || relay_ip == "47.115.35.7".parse().unwrap_or(relay_ip) {
+    let send_addr = if relay_ip.is_loopback() || relay_ip.is_unspecified() {
         format!("127.0.0.1:{}", relay.port())
     } else {
         relay_addr.to_string()
